@@ -49,7 +49,6 @@ const CELLS_PER_ROW: usize = ATLAS / MAP_SIZE;
 const CELLS: usize = CELLS_PER_ROW * CELLS_PER_ROW;
 
 const TEXT_WHITE: u32 = 0xFFFF_FFFF;
-const TEXT_GRAY: u32 = 0xFFAA_AAAA;
 
 // ---------------------------------------------------------------------------------------------
 // Payloads: the client asks for a map, the server answers with its colour ids
@@ -316,20 +315,6 @@ fn color_of(host: &dyn ClientHost, item: ItemKey, kind: &str, plain: u32, other:
     if is(&format!("minecraft:{kind}")) { plain } else { other }
 }
 
-/// The colours one panel is drawn with, ARGB.
-#[derive(Clone, Copy)]
-struct Style {
-    background: u32,
-    top: u32,
-    bottom: u32,
-}
-
-/// The vanilla tooltip's colours, for maps.
-const TOOLTIP_STYLE: Style = Style {
-    background: 0xF010_0010,
-    top: 0xF050_00FF,
-    bottom: 0xF028_007F,
-};
 
 
 
@@ -447,41 +432,6 @@ fn plain(host: &dyn ClientHost, text: &Text) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// Draws a tooltip box `w` x `h` GUI pixels hung from the cursor as the game hangs one, kept on
-/// screen, and returns where its content starts.
-fn panel(
-    draw: &mut dyn DrawContext,
-    cursor: [i32; 2],
-    screen: [i32; 2],
-    w: f32,
-    h: f32,
-    style: Style,
-) -> [f32; 2] {
-    let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
-    let (sw, sh) = (screen[0] as f32, screen[1] as f32);
-    let mut x = cx + 12.0;
-    if x + w + 4.0 > sw {
-        x = cx - 12.0 - w;
-    }
-    x = x.max(4.0);
-    let mut y = cy - 12.0;
-    if y + h + 4.0 > sh {
-        y = sh - h - 4.0;
-    }
-    y = y.max(4.0);
-
-    let Style {
-        background,
-        top,
-        bottom,
-        ..
-    } = style;
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], background);
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], top);
-    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], bottom);
-    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], top, bottom);
-    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], top, bottom);
-    [x, y]
-}
 
 /// Gray `gray` (one channel, as vanilla's GUI textures use) multiplied by `tint` (`0xRRGGBB`), ARGB.
 fn mul(gray: u32, tint: u32) -> u32 {
@@ -588,37 +538,76 @@ fn draw_contents(
     draw.text(&footer, [x, gy + grid_h + 3.0], label, shadow);
 }
 
-/// The map panel: its picture (atlas cell `cell`) with the item name and id.
-fn draw_map(
-    draw: &mut dyn DrawContext,
-    cursor: [i32; 2],
-    screen: [i32; 2],
-    title: &str,
-    id: i32,
-    cell: usize,
-) {
+/// The paper a map is drawn on, under its unexplored (transparent) pixels.
+const MAP_PAPER: u32 = 0xFFDD_D0B0;
+/// Width of the parchment frame around a hovered map, in GUI pixels (four 2 px bands).
+const FRAME: f32 = 8.0;
+
+/// A fixed pseudo-random number for `(a, b)`, so the torn edge never flickers.
+fn noise(a: u32, b: u32) -> u32 {
+    (a.wrapping_mul(73_856_093) ^ b.wrapping_mul(19_349_663)).wrapping_mul(2_654_435_761) >> 16
+}
+
+/// How deep the edge is torn at block `i` along side `side`, 0 to 2 blocks.
+fn tear(side: u32, i: u32) -> u32 {
+    // Mostly shallow, with some deeper bites.
+    match noise(side, i / 2) % 8 {
+        0 | 1 => 2,
+        2 | 3 | 4 => 1,
+        _ => 0,
+    }
+}
+
+/// The frame's paper and the darker rim along its torn edge.
+const FRAME_PAPER: u32 = 0xFFD5_BE93;
+const FRAME_RIM: u32 = 0xFF8E_7D5B;
+
+/// The hovered map as it looks held in hand: the picture inside a parchment frame, its name over
+/// it.
+fn draw_map(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], title: &str, cell: usize) {
     let image = MAP_SIZE as f32 * MAP_SCALE;
-    let footer = format!("Map #{id}");
-    let w = (image + 2.0)
-        .max(draw.text_width(title))
-        .max(draw.text_width(&footer));
-    let h = 12.0 + image + 2.0 + 12.0;
-    let [x, y] = panel(draw, cursor, screen, w, h, TOOLTIP_STYLE);
+    let outer = image + FRAME * 2.0;
+    let (w, h) = (outer.max(draw.text_width(title)), 11.0 + outer);
+    let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
+    let (sw, sh) = (screen[0] as f32, screen[1] as f32);
+    let mut x = cx + 12.0;
+    if x + w + 2.0 > sw {
+        x = cx - 12.0 - w;
+    }
+    x = x.max(2.0);
+    let mut y = cy - 12.0;
+    if y + h + 2.0 > sh {
+        y = sh - h - 2.0;
+    }
+    y = y.max(2.0);
 
     draw.text(title, [x, y], TEXT_WHITE, true);
-
-    let ix = x + ((w - image - 2.0) / 2.0).floor();
-    let iy = y + 12.0;
-    // Frame, then the paper the map is drawn on.
-    draw.fill([ix, iy, image + 2.0, image + 2.0], 0xFF00_0000);
-    draw.fill([ix + 1.0, iy + 1.0, image, image], 0xFFD1_B380);
-    draw.sprite(
-        MOD_IMAGE_SPRITE,
-        cell_rect(cell),
-        [ix + 1.0, iy + 1.0, image, image],
-        None,
-    );
-    draw.text(&footer, [x, iy + image + 5.0], TEXT_GRAY, true);
+    let (fx, fy) = (x, y + 11.0);
+    // A sheet of paper with torn edges, in 2 x 2 blocks: each block is cut away, rim, or paper by
+    // how far it is from the nearest side against how deep that side is torn there.
+    let blocks = (outer / 2.0) as u32;
+    let last = blocks - 1;
+    for by in 0..blocks {
+        for bx in 0..blocks {
+            let sides = [(0, bx, by), (1, bx, last - by), (2, by, bx), (3, by, last - bx)];
+            let mut color = FRAME_PAPER;
+            for (side, along, depth) in sides {
+                let torn = tear(side, along);
+                if depth < torn {
+                    color = 0;
+                    break;
+                }
+                if depth == torn {
+                    color = FRAME_RIM;
+                }
+            }
+            if color != 0 {
+                draw.fill([fx + bx as f32 * 2.0, fy + by as f32 * 2.0, 2.0, 2.0], color);
+            }
+        }
+    }
+    let (ix, iy) = (fx + FRAME, fy + FRAME);
+    draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [ix, iy, image, image], None);
 }
 
 
@@ -876,7 +865,7 @@ impl Hooks for UniversalViewer {
                 let Some(cell) = cell else {
                     return Flow::Continue;
                 };
-                draw_map(draw, cursor, screen, &title, id, cell);
+                draw_map(draw, cursor, screen, &title, cell);
             }
         }
         Flow::Cancel
@@ -901,13 +890,9 @@ impl ItemPart for MapIcon {
             return;
         };
         let (x, y) = (event.x, event.y);
-        // Paper edge, then the picture, over the vanilla icon.
-        event.draw.fill([x, y, 16.0, 16.0], 0xFFD1_B380);
-        event.draw.fill([x, y, 16.0, 1.0], 0xFF8A_6A3A);
-        event.draw.fill([x, y + 15.0, 16.0, 1.0], 0xFF8A_6A3A);
-        event.draw.fill([x, y, 1.0, 16.0], 0xFF8A_6A3A);
-        event.draw.fill([x + 15.0, y, 1.0, 16.0], 0xFF8A_6A3A);
-        event.draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x + 1.0, y + 1.0, 14.0, 14.0], None);
+        // The whole picture over the vanilla icon, edge to edge.
+        event.draw.fill([x, y, 16.0, 16.0], MAP_PAPER);
+        event.draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x, y, 16.0, 16.0], None);
     }
 }
 
