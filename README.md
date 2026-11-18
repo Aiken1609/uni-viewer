@@ -1,3 +1,5 @@
+![Universal Viewer](icon.png)
+
 # Universal Viewer
 
 A [Horizon](https://github.com/horizon-rust/horizon) mod (Minecraft 26.3 in Rust) to look inside things without opening them.
