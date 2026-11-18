@@ -13,7 +13,8 @@
 use mod_api::{
     ClientHost, ClientTickPreEvent, DrawContext, HostSide, LevelDimension, RightClickBlockEvent,
     ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
-    Identifier, ItemKey, ItemPart, ItemStack,
+    Identifier, ItemKey, ItemPart, ItemStack, TooltipComponentDrawEvent, TooltipImage,
+    TooltipImageSource,
     PayloadCodec, PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
     RenderTooltipPreEvent, Tag, Text, ToClient, ToServer, TooltipElement, VarInt,
 };
@@ -581,62 +582,71 @@ fn tear(side: u32, i: u32) -> u32 {
 const FRAME_PAPER: u32 = 0xFFD5_BE93;
 const FRAME_RIM: u32 = 0xFF8E_7D5B;
 
-/// Vanilla's tooltip colours: the panel the map sits in.
-const TIP_BACKGROUND: u32 = 0xF010_0010;
-const TIP_TOP: u32 = 0xF050_00FF;
-const TIP_BOTTOM: u32 = 0xF028_007F;
-/// Vanilla's gray tooltip lore.
-const TEXT_GRAY: u32 = 0xFFAA_AAAA;
 /// Vanilla's frame around a held map: 7 px of `map_background` around the 128 px picture.
 const HELD_FRAME: f32 = 7.0;
 const MAP_BACKGROUND: &str = "map/map_background";
 
-/// The hovered map in a vanilla tooltip: its name, the picture in the held-map frame, then its
-/// id, zoom and lock.
-fn draw_map(
-    host: &dyn ClientHost,
-    draw: &mut dyn DrawContext,
-    cursor: [i32; 2],
-    screen: [i32; 2],
-    title: &str,
-    id: i32,
-    cell: usize,
-) {
+/// Gray tooltip lines this mod adds.
+const LORE_GRAY: u32 = 0xAAAA_AAFF;
+
+/// Puts map `id`'s picture into its tooltip, under the name, as an image component the game lays
+/// out with every other line (vanilla's, a server's lore and prices, other mods'), and adds its
+/// zoom and lock under vanilla's id line.
+fn add_map_to_tooltip(host: &dyn ClientHost, event: &mut RenderTooltipGatherComponentsEvent<'_>, id: i32) {
+    let ready = with_cache(|cache| {
+        cache.hovered = Some(id);
+        cache.ready(id).is_some()
+    });
+    if !ready {
+        return;
+    }
+    let outer = MAP_SIZE as f32 * MAP_SCALE + HELD_FRAME * 2.0;
+    let image = TooltipElement::Image(TooltipImage {
+        source: TooltipImageSource::ItemPart(event.stack.clone()),
+        size: [outer, outer + 4.0],
+    });
+    let at = 1.min(event.elements.len());
+    event.elements.insert(at, image);
+
+    let Some((scale, locked)) = map_info(id) else {
+        return;
+    };
+    let lines: Vec<String> = event
+        .elements
+        .iter()
+        .map(|element| match element {
+            TooltipElement::Text(text, _) => plain(host, text),
+            TooltipElement::Image(_) => String::new(),
+        })
+        .collect();
+    let locked_word = host.translate("filled_map.locked").unwrap_or_else(|| "Locked".to_string());
+    let id_text = format!("#{id}");
+    // Under vanilla's "Id #n" (and its "Locked"), else right under the picture.
+    let mut after = lines
+        .iter()
+        .position(|line| line.contains(&id_text))
+        .map_or(at + 1, |i| i + 1);
+    let has_locked = lines.iter().any(|line| line.trim() == locked_word);
+    if has_locked && lines.get(after).is_some_and(|line| line.trim() == locked_word) {
+        after += 1;
+    }
+    let mut extra = vec![format!("Scale 1:{}", 1u32 << scale)];
+    if !locked {
+        extra.push("Unlocked".to_string());
+    } else if !has_locked {
+        extra.push(locked_word);
+    }
+    for (i, line) in extra.into_iter().enumerate() {
+        let at = (after + i).min(event.elements.len());
+        event.elements.insert(at, TooltipElement::Text(Text::literal(line), LORE_GRAY));
+    }
+}
+
+/// Draws the held-map frame and the picture of the map in `stack` with its top left at `origin`.
+fn draw_framed_map(host: &dyn ClientHost, draw: &mut dyn DrawContext, origin: [f32; 2], cell: usize) {
     let image = MAP_SIZE as f32 * MAP_SCALE;
     let outer = image + HELD_FRAME * 2.0;
-    let mut lines = vec![format!("Map #{id}")];
-    if let Some((scale, locked)) = map_info(id) {
-        lines.push(format!("Scale 1:{}", 1u32 << scale));
-        lines.push(if locked { "Locked" } else { "Unlocked" }.to_string());
-    }
-    let mut w = outer.max(draw.text_width(title));
-    for line in &lines {
-        w = w.max(draw.text_width(line));
-    }
-    let h = 12.0 + outer + 3.0 + lines.len() as f32 * 10.0;
-
-    // Placed like vanilla's tooltip: right of the cursor, flipped and clamped at the edges.
-    let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
-    let (sw, sh) = (screen[0] as f32, screen[1] as f32);
-    let mut x = cx + 12.0;
-    if x + w + 4.0 > sw {
-        x = cx - 16.0 - w;
-    }
-    x = x.max(4.0);
-    let mut y = cy - 12.0;
-    if y + h + 4.0 > sh {
-        y = sh - h - 4.0;
-    }
-    y = y.max(4.0);
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], TIP_BACKGROUND);
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], TIP_TOP);
-    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], TIP_BOTTOM);
-    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
-    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
-
-    draw.text(title, [x, y], TEXT_WHITE, true);
-    let fx = x + ((w - outer) / 2.0).floor();
-    let fy = y + 12.0;
+    let [fx, fy] = origin;
     // The game's own `map_background` (so a resource pack's shows too), else a drawn one.
     let frame = Identifier::parse("minecraft:map/map_background")
         .ok()
@@ -650,9 +660,6 @@ fn draw_map(
     }
     let (ix, iy) = (fx + HELD_FRAME, fy + HELD_FRAME);
     draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [ix, iy, image, image], None);
-    for (i, line) in lines.iter().enumerate() {
-        draw.text(line, [x, fy + outer + 3.0 + i as f32 * 10.0], TEXT_GRAY, true);
-    }
 }
 
 /// A sheet of paper with torn edges, `size` square, for when the game has no `map_background`.
@@ -898,6 +905,9 @@ impl Hooks for UniversalViewer {
                 0xFF55_55FF,
             ));
         }
+        if let Some(View::Map(id)) = view_of(host, event.stack, false) {
+            add_map_to_tooltip(host, event, id);
+        }
         Flow::Continue
     }
 
@@ -926,15 +936,9 @@ impl Hooks for UniversalViewer {
         match view {
             View::Contents(contents) => draw_contents(draw, cursor, screen, &title, &contents),
             View::Map(id) => {
-                let cell = with_cache(|cache| {
-                    cache.hovered = Some(id);
-                    cache.ready(id)
-                });
-                // Until the picture is here, the vanilla tooltip stays.
-                let Some(cell) = cell else {
-                    return Flow::Continue;
-                };
-                draw_map(host, draw, cursor, screen, &title, id, cell);
+                // The picture is a component of the game's own tooltip (`add_map_to_tooltip`).
+                with_cache(|cache| cache.hovered = Some(id));
+                return Flow::Continue;
             }
         }
         Flow::Cancel
@@ -947,6 +951,17 @@ pub struct MapIcon;
 
 #[mod_api::horizon_part]
 impl ItemPart for MapIcon {
+    /// The map picture component `add_map_to_tooltip` put in the tooltip.
+    fn tooltip_component_draw(&self, host: &dyn ClientHost, event: &mut TooltipComponentDrawEvent<'_>) {
+        let Some(View::Map(id)) = view_of(host, event.stack, false) else {
+            return;
+        };
+        let Some(cell) = with_cache(|cache| cache.ready(id)) else {
+            return;
+        };
+        draw_framed_map(host, &mut *event.draw, event.origin, cell);
+    }
+
     fn item_decorations(&self, host: &dyn ClientHost, event: &mut ItemDecorationsEvent<'_>) {
         let Some(View::Map(id)) = view_of(host, event.stack, false) else {
             return;
@@ -959,9 +974,16 @@ impl ItemPart for MapIcon {
             return;
         };
         let (x, y) = (event.x, event.y);
-        // The whole picture over the vanilla icon, edge to edge.
+        // The whole picture over the vanilla icon, edge to edge, then the stack count back on top
+        // where vanilla puts it.
         event.draw.fill([x, y, 16.0, 16.0], MAP_PAPER);
         event.draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x, y, 16.0, 16.0], None);
+        let count = event.stack.count();
+        if count > 1 {
+            let text = count.to_string();
+            let width = event.draw.text_width(&text);
+            event.draw.text(&text, [x + 17.0 - width, y + 9.0], TEXT_WHITE, true);
+        }
     }
 }
 
