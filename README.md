@@ -80,5 +80,5 @@ Untuk pindah build, ganti `horizon = "..."` di `horizon-mod.toml` dengan commit 
 
 ## Lisensi
 
-MIT. Bingkai map memakai texture `map_background` milik game itu sendiri saat runtime; repo ini tidak menyertakan
+MIT [LICENSE](https://github.com/Aiken1609/uni-viewer/blob/7c06bc6c90e578d0c980d993a3fe059df4068494/LICENSE). Bingkai map memakai texture `map_background` milik game itu sendiri saat runtime; repo ini tidak menyertakan
 aset Minecraft.
