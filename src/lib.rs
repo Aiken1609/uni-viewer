@@ -12,7 +12,7 @@
 
 use mod_api::{
     ClientHost, ClientTickPreEvent, DrawContext, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
-    ItemPart, ItemStack,
+    Identifier, ItemKey, ItemPart, ItemStack,
     PayloadCodec, PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
     RenderTooltipPreEvent, Tag, Text, ToClient, ToServer, TooltipElement, VarInt,
 };
@@ -244,7 +244,68 @@ struct Contents {
     slots: Vec<(usize, ItemStack)>,
     /// Total items, for the footer.
     items: u64,
+    /// The colour of the shulker box or bundle, `0xRRGGBB`, to tint the panel with.
+    color: u32,
 }
+
+/// Dye colours as vanilla tints shulker boxes and bundles (`DyeColor.getTextureDiffuseColor`).
+const DYES: [(&str, u32); 16] = [
+    ("white", 0xF9FFFE),
+    ("orange", 0xF9801D),
+    ("magenta", 0xC74EBD),
+    ("light_blue", 0x3AB3DA),
+    ("yellow", 0xFED83D),
+    ("lime", 0x80C71F),
+    ("pink", 0xF38BAA),
+    ("gray", 0x474F52),
+    ("light_gray", 0x9D9D97),
+    ("cyan", 0x169C9C),
+    ("purple", 0x8932B8),
+    ("blue", 0x3C44AA),
+    ("brown", 0x835432),
+    ("green", 0x5E7C16),
+    ("red", 0xB02E26),
+    ("black", 0x1D1D21),
+];
+/// An undyed shulker box's purple, and an undyed bundle's leather.
+const PLAIN_SHULKER: u32 = 0x97_6997;
+const PLAIN_BUNDLE: u32 = 0xA8_6B3C;
+/// Anything else that holds items (a chest item with contents, a modded box).
+const PLAIN_OTHER: u32 = 0x6E_4C9E;
+
+/// The colour of `item` if it is `minecraft:<dye>_<kind>`, else `plain` when it is
+/// `minecraft:<kind>` itself, else `other`.
+fn color_of(host: &dyn ClientHost, item: ItemKey, kind: &str, plain: u32, other: u32) -> u32 {
+    let is = |id: &str| {
+        Identifier::parse(id)
+            .ok()
+            .and_then(|id| host.item_key(&id))
+            .is_some_and(|key| key == item)
+    };
+    for (dye, rgb) in DYES {
+        if is(&format!("minecraft:{dye}_{kind}")) {
+            return rgb;
+        }
+    }
+    if is(&format!("minecraft:{kind}")) { plain } else { other }
+}
+
+/// The colours one panel is drawn with, ARGB.
+#[derive(Clone, Copy)]
+struct Style {
+    background: u32,
+    top: u32,
+    bottom: u32,
+}
+
+/// The vanilla tooltip's colours, for maps.
+const VANILLA: Style = Style {
+    background: 0xF010_0010,
+    top: 0xF050_00FF,
+    bottom: 0xF028_007F,
+};
+
+
 
 /// The stack's component patch as one NBT compound to look entries up in.
 fn components(stack: &ItemStack) -> Option<Tag> {
@@ -295,7 +356,8 @@ fn view_of(host: &dyn ClientHost, stack: &ItemStack, with_contents: bool) -> Opt
         }
         let highest = slots.iter().map(|(slot, _)| *slot).max().unwrap_or(0);
         let rows = (highest / COLUMNS + 1).max(3);
-        return Some(View::Contents(finish(COLUMNS, rows, slots)));
+        let color = color_of(host, stack.item(), "shulker_box", PLAIN_SHULKER, PLAIN_OTHER);
+        return Some(View::Contents(finish(COLUMNS, rows, slots, color)));
     }
     if let Some(Tag::List(entries)) = root.get("minecraft:bundle_contents") {
         let slots: Vec<(usize, ItemStack)> = entries
@@ -308,18 +370,20 @@ fn view_of(host: &dyn ClientHost, stack: &ItemStack, with_contents: bool) -> Opt
         }
         let columns = slots.len().clamp(1, COLUMNS);
         let rows = slots.len().div_ceil(columns);
-        return Some(View::Contents(finish(columns, rows, slots)));
+        let color = color_of(host, stack.item(), "bundle", PLAIN_BUNDLE, PLAIN_BUNDLE);
+        return Some(View::Contents(finish(columns, rows, slots, color)));
     }
     None
 }
 
-fn finish(columns: usize, rows: usize, slots: Vec<(usize, ItemStack)>) -> Contents {
+fn finish(columns: usize, rows: usize, slots: Vec<(usize, ItemStack)>, color: u32) -> Contents {
     let items = slots.iter().map(|(_, s)| u64::from(s.count())).sum();
     Contents {
         columns,
         rows,
         slots,
         items,
+        color,
     }
 }
 
@@ -358,7 +422,14 @@ fn plain(host: &dyn ClientHost, text: &Text) -> String {
 
 /// Draws a tooltip box `w` x `h` GUI pixels hung from the cursor as the game hangs one, kept on
 /// screen, and returns where its content starts.
-fn panel(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], w: f32, h: f32) -> [f32; 2] {
+fn panel(
+    draw: &mut dyn DrawContext,
+    cursor: [i32; 2],
+    screen: [i32; 2],
+    w: f32,
+    h: f32,
+    style: Style,
+) -> [f32; 2] {
     let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
     let (sw, sh) = (screen[0] as f32, screen[1] as f32);
     let mut x = cx + 12.0;
@@ -372,15 +443,85 @@ fn panel(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], w: f32,
     }
     y = y.max(4.0);
 
-    const BACKGROUND: u32 = 0xF010_0010;
-    const TOP: u32 = 0xF050_00FF;
-    const BOTTOM: u32 = 0xF028_007F;
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], BACKGROUND);
-    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], TOP);
-    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], BOTTOM);
-    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], TOP, BOTTOM);
-    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], TOP, BOTTOM);
+    let Style {
+        background,
+        top,
+        bottom,
+        ..
+    } = style;
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], background);
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], top);
+    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], bottom);
+    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], top, bottom);
+    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], top, bottom);
     [x, y]
+}
+
+/// Gray `gray` (one channel, as vanilla's GUI textures use) multiplied by `tint` (`0xRRGGBB`), ARGB.
+fn mul(gray: u32, tint: u32) -> u32 {
+    let channel = |shift: u32| (((tint >> shift) & 0xFF) * gray / 255) << shift;
+    0xFF00_0000 | channel(16) | channel(8) | channel(0)
+}
+
+/// A dye colour softened toward white, so even black and gray boxes keep a readable panel.
+fn soften(rgb: u32) -> u32 {
+    let channel = |shift: u32| {
+        let c = ((rgb >> shift) & 0xFF) as f32;
+        ((c * 0.7 + 255.0 * 0.3).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// Inner padding of the vanilla-style panel, as a container screen has.
+const PAD: f32 = 7.0;
+
+/// A container-screen panel (black outline, light top-left bevel, dark bottom-right bevel,
+/// `#C6C6C6` face), all multiplied by `tint`. `w` x `h` is the content; returns its corner.
+fn vanilla_panel(
+    draw: &mut dyn DrawContext,
+    cursor: [i32; 2],
+    screen: [i32; 2],
+    w: f32,
+    h: f32,
+    tint: u32,
+) -> [f32; 2] {
+    let (pw, ph) = (w + PAD * 2.0, h + PAD * 2.0);
+    let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
+    let (sw, sh) = (screen[0] as f32, screen[1] as f32);
+    let mut x = cx + 12.0;
+    if x + pw + 2.0 > sw {
+        x = cx - 12.0 - pw;
+    }
+    x = x.max(2.0);
+    let mut y = cy - 12.0;
+    if y + ph + 2.0 > sh {
+        y = sh - ph - 2.0;
+    }
+    y = y.max(2.0);
+
+    let black = 0xFF00_0000;
+    let (face, light, dark) = (mul(0xC6, tint), mul(0xFF, tint), mul(0x55, tint));
+    // Outline with cut corners.
+    draw.fill([x + 1.0, y, pw - 2.0, 1.0], black);
+    draw.fill([x + 1.0, y + ph - 1.0, pw - 2.0, 1.0], black);
+    draw.fill([x, y + 1.0, 1.0, ph - 2.0], black);
+    draw.fill([x + pw - 1.0, y + 1.0, 1.0, ph - 2.0], black);
+    draw.fill([x + 1.0, y + 1.0, pw - 2.0, ph - 2.0], face);
+    // Bevels.
+    draw.fill([x + 1.0, y + 1.0, pw - 4.0, 2.0], light);
+    draw.fill([x + 1.0, y + 1.0, 2.0, ph - 4.0], light);
+    draw.fill([x + 3.0, y + ph - 3.0, pw - 4.0, 2.0], dark);
+    draw.fill([x + pw - 3.0, y + 3.0, 2.0, ph - 4.0], dark);
+    [x + PAD, y + PAD]
+}
+
+/// One sunken inventory slot at `(x, y)`, 18 x 18, tinted.
+fn vanilla_slot(draw: &mut dyn DrawContext, x: f32, y: f32, tint: u32) {
+    draw.fill([x, y, SLOT, SLOT], mul(0x8B, tint));
+    draw.fill([x, y, SLOT - 1.0, 1.0], mul(0x37, tint));
+    draw.fill([x, y, 1.0, SLOT - 1.0], mul(0x37, tint));
+    draw.fill([x + 1.0, y + SLOT - 1.0, SLOT - 1.0, 1.0], mul(0xFF, tint));
+    draw.fill([x + SLOT - 1.0, y + 1.0, 1.0, SLOT - 1.0], mul(0xFF, tint));
 }
 
 fn draw_contents(
@@ -396,19 +537,22 @@ fn draw_contents(
     let w = grid_w
         .max(draw.text_width(title))
         .max(draw.text_width(&footer));
-    let h = 12.0 + grid_h + 12.0;
-    let [x, y] = panel(draw, cursor, screen, w, h);
+    let h = 11.0 + grid_h + 11.0;
+    let tint = soften(contents.color);
+    let [x, y] = vanilla_panel(draw, cursor, screen, w, h, tint);
 
-    draw.text(title, [x, y], TEXT_WHITE, true);
+    // Vanilla's dark label colour on a light face, white with a shadow on a dark one.
+    let face = mul(0xC6, tint);
+    let luma = ((face >> 16) & 0xFF) * 3 + ((face >> 8) & 0xFF) * 6 + (face & 0xFF);
+    let (label, shadow) = if luma > 1300 { (0xFF40_4040, false) } else { (TEXT_WHITE, true) };
+
+    draw.text(title, [x, y], label, shadow);
 
     let gx = x + ((w - grid_w) / 2.0).floor();
-    let gy = y + 12.0;
+    let gy = y + 11.0;
     for row in 0..contents.rows {
         for column in 0..contents.columns {
-            let sx = gx + column as f32 * SLOT;
-            let sy = gy + row as f32 * SLOT;
-            draw.fill([sx, sy, SLOT, SLOT], 0xFF8B_8B8B);
-            draw.fill([sx + 1.0, sy + 1.0, SLOT - 2.0, SLOT - 2.0], 0xFF37_3737);
+            vanilla_slot(draw, gx + column as f32 * SLOT, gy + row as f32 * SLOT, tint);
         }
     }
     for (slot, stack) in &contents.slots {
@@ -417,7 +561,7 @@ fn draw_contents(
         let count = (stack.count() > 1).then(|| stack.count().to_string());
         draw.gui_draw_item_with(stack, [sx + 1.0, sy + 1.0], count.as_deref());
     }
-    draw.text(&footer, [x, gy + grid_h + 3.0], TEXT_GRAY, true);
+    draw.text(&footer, [x, gy + grid_h + 3.0], label, shadow);
 }
 
 /// What the map panel can show right now.
@@ -442,7 +586,7 @@ fn draw_map(
         .max(draw.text_width(title))
         .max(draw.text_width(&footer));
     let h = 12.0 + image + 2.0 + 12.0;
-    let [x, y] = panel(draw, cursor, screen, w, h);
+    let [x, y] = panel(draw, cursor, screen, w, h, VANILLA);
 
     draw.text(title, [x, y], TEXT_WHITE, true);
 
@@ -569,7 +713,8 @@ impl Hooks for UniversalViewer {
         {
             event.elements.push(TooltipElement::Text(
                 Text::literal("Hold Shift to view contents"),
-                0xAAAA_AAFF,
+                // Bright red (`rgba`).
+                0xFF55_55FF,
             ));
         }
         Flow::Continue
