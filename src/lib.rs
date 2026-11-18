@@ -362,6 +362,44 @@ fn draw_map(
     draw.text(&footer, [x, iy + image + 5.0], TEXT_GRAY, true);
 }
 
+
+/// Lines for the Ctrl+Shift debug panel.
+fn debug_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<String> {
+    let mut lines = vec![
+        "Universal Viewer debug (hook is running)".to_string(),
+        format!("count: {}", stack.count()),
+    ];
+    match stack.components().map(|c| c.as_nbt()) {
+        None => lines.push("components: none (no patch on this stack)".to_string()),
+        Some(patch) => {
+            lines.push(format!("components: {}", patch.len()));
+            for key in patch.keys().take(10) {
+                lines.push(format!("  {}", key.to_string_lossy()));
+            }
+        }
+    }
+    let kind = match view_of(host, stack, true) {
+        Some(View::Map(id)) => format!("view: map #{id}"),
+        Some(View::Contents(c)) => format!("view: contents, {} slots", c.slots.len()),
+        None => "view: none".to_string(),
+    };
+    lines.push(kind);
+    lines
+}
+
+fn draw_debug(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], lines: &[String]) {
+    let w = lines
+        .iter()
+        .map(|line| draw.text_width(line))
+        .fold(0.0_f32, f32::max);
+    let h = lines.len() as f32 * 10.0;
+    let [x, y] = panel(draw, cursor, screen, w, h);
+    for (index, line) in lines.iter().enumerate() {
+        let color = if index == 0 { TEXT_WHITE } else { TEXT_GRAY };
+        draw.text(line, [x, y + index as f32 * 10.0], color, true);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The mod
 // ---------------------------------------------------------------------------------------------
@@ -458,7 +496,17 @@ impl Hooks for UniversalViewer {
         let Some(stack) = event.stack else {
             return Flow::Continue;
         };
-        let shift = host.modifiers().shift();
+        let modifiers = host.modifiers();
+        let shift = modifiers.shift();
+        if shift && modifiers.control() {
+            // Debug panel (Ctrl+Shift while hovering any item): proves the hook runs and shows
+            // which components the stack carries.
+            let cursor = [event.place.x, event.place.y];
+            let screen = [event.screen_width, event.screen_height];
+            let lines = debug_lines(host, stack);
+            draw_debug(&mut *event.draw, cursor, screen, &lines);
+            return Flow::Cancel;
+        }
         let Some(view) = view_of(host, stack, shift) else {
             return Flow::Continue;
         };
