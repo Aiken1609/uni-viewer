@@ -22,7 +22,7 @@
 ## Persyaratan
 
 - Horizon launcher **0.2.73** atau lebih baru
-- Instance di Nightly **0b14f8a** (18 November 2026). Mod ini memakai mixin untuk membaca data map, dan mixin terikat
+- Instance di Nightly **6d765e0** (18 November 2026). Mod ini memakai mixin untuk membaca data map, dan mixin terikat
   ke build game yang dituju, jadi Nightly lain butuh mod yang sudah dipindah ke build itu.
 - Mod native dikompilasi di komputer kamu dan berjalan dengan hak akses yang sama seperti game, tanpa sandbox.
   Baca source-nya dulu kalau perlu.
