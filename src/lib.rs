@@ -11,7 +11,8 @@
 //! the answer. On a server without this mod the map panel says so instead of drawing.
 
 use mod_api::{
-    ClientHost, ClientTickPreEvent, DrawContext, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
+    ClientHost, ClientTickPreEvent, DrawContext, HostSide, LevelDimension, RightClickBlockEvent,
+    ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
     Identifier, ItemKey, ItemPart, ItemStack,
     PayloadCodec, PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
     RenderTooltipPreEvent, Tag, Text, ToClient, ToServer, TooltipElement, VarInt,
@@ -36,8 +37,6 @@ const SLOT: f32 = 18.0;
 const COLUMNS: usize = 9;
 /// Ticks before a map that is still hovered is asked for again, so a map being explored updates.
 const REFRESH_TICKS: u64 = 100;
-/// Ticks after a request with no answer before the panel says the server can't provide it.
-const GIVE_UP_TICKS: u64 = 60;
 /// Ticks before a map shown only on its slot icon is asked for again.
 const ICON_REFRESH_TICKS: u64 = 400;
 /// At most this many map requests go out per tick (a chest full of maps opens gradually).
@@ -109,6 +108,8 @@ struct Cache {
     on_slots: HashSet<i32>,
     /// Maps still arriving: their colour ids so far and which slices came.
     partial: HashMap<i32, (Vec<u8>, u8)>,
+    /// The `VANILLA` version of each map last copied into the atlas.
+    vanilla: HashMap<i32, u64>,
     /// All map pictures, `ATLAS * ATLAS` RGBA pixels; empty until the first map arrives.
     atlas: Vec<u8>,
     /// Bumped on every write into `atlas`.
@@ -192,6 +193,31 @@ fn cell_rect(cell: usize) -> [f32; 4] {
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+/// Map pictures the server sent the game itself (vanilla's map packet, read by the
+/// `vanilla_map` mixin): id to colour ids, with a counter bumped on each change. Works on any
+/// server, the mod or not on it, for every map the client has been sent: one carried, held or
+/// in a nearby item frame.
+static VANILLA_MAPS: Mutex<Option<(u64, HashMap<i32, (u64, Vec<u8>)>)>> = Mutex::new(None);
+
+/// Called by the `vanilla_map` mixin with a map's whole picture after a vanilla map packet.
+pub fn vanilla_map_colors(id: i32, colors: Vec<u8>) {
+    if colors.len() != MAP_SIZE * MAP_SIZE {
+        return;
+    }
+    let mut guard = VANILLA_MAPS.lock().unwrap_or_else(|p| p.into_inner());
+    let (counter, maps) = guard.get_or_insert_with(|| (0, HashMap::new()));
+    *counter += 1;
+    maps.insert(id, (*counter, colors));
+}
+
+/// Map `id`'s picture from the game's own copy, when newer than `after`.
+fn vanilla_colors(id: i32, after: u64) -> Option<(u64, Vec<u8>)> {
+    let guard = VANILLA_MAPS.lock().unwrap_or_else(|p| p.into_inner());
+    let (_, maps) = guard.as_ref()?;
+    let (version, colors) = maps.get(&id)?;
+    (*version > after).then(|| (*version, colors.clone()))
+}
 
 fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
     let mut guard = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -299,7 +325,7 @@ struct Style {
 }
 
 /// The vanilla tooltip's colours, for maps.
-const VANILLA: Style = Style {
+const TOOLTIP_STYLE: Style = Style {
     background: 0xF010_0010,
     top: 0xF050_00FF,
     bottom: 0xF028_007F,
@@ -542,9 +568,7 @@ fn draw_contents(
     let [x, y] = vanilla_panel(draw, cursor, screen, w, h, tint);
 
     // Vanilla's dark label colour on a light face, white with a shadow on a dark one.
-    let face = mul(0xC6, tint);
-    let luma = ((face >> 16) & 0xFF) * 3 + ((face >> 8) & 0xFF) * 6 + (face & 0xFF);
-    let (label, shadow) = if luma > 1300 { (0xFF40_4040, false) } else { (TEXT_WHITE, true) };
+    let (label, shadow) = if dark_face(tint) { (TEXT_WHITE, true) } else { (0xFF40_4040, false) };
 
     draw.text(title, [x, y], label, shadow);
 
@@ -564,21 +588,14 @@ fn draw_contents(
     draw.text(&footer, [x, gy + grid_h + 3.0], label, shadow);
 }
 
-/// What the map panel can show right now.
-enum MapState {
-    /// In the atlas, at this cell.
-    Ready(usize),
-    Loading,
-    Unavailable,
-}
-
+/// The map panel: its picture (atlas cell `cell`) with the item name and id.
 fn draw_map(
     draw: &mut dyn DrawContext,
     cursor: [i32; 2],
     screen: [i32; 2],
     title: &str,
     id: i32,
-    state: MapState,
+    cell: usize,
 ) {
     let image = MAP_SIZE as f32 * MAP_SCALE;
     let footer = format!("Map #{id}");
@@ -586,7 +603,7 @@ fn draw_map(
         .max(draw.text_width(title))
         .max(draw.text_width(&footer));
     let h = 12.0 + image + 2.0 + 12.0;
-    let [x, y] = panel(draw, cursor, screen, w, h, VANILLA);
+    let [x, y] = panel(draw, cursor, screen, w, h, TOOLTIP_STYLE);
 
     draw.text(title, [x, y], TEXT_WHITE, true);
 
@@ -595,26 +612,49 @@ fn draw_map(
     // Frame, then the paper the map is drawn on.
     draw.fill([ix, iy, image + 2.0, image + 2.0], 0xFF00_0000);
     draw.fill([ix + 1.0, iy + 1.0, image, image], 0xFFD1_B380);
-    match state {
-        MapState::Ready(cell) => {
-            draw.sprite(
-                MOD_IMAGE_SPRITE,
-                cell_rect(cell),
-                [ix + 1.0, iy + 1.0, image, image],
-                None,
-            );
-        }
-        MapState::Loading => {
-            draw.text("Loading map...", [ix + 8.0, iy + 8.0], 0xFF40_3020, false);
-        }
-        MapState::Unavailable => {
-            draw.text("Map data unavailable", [ix + 8.0, iy + 8.0], 0xFF40_3020, false);
-            draw.text("(server needs this mod)", [ix + 8.0, iy + 20.0], 0xFF40_3020, false);
-        }
-    }
+    draw.sprite(
+        MOD_IMAGE_SPRITE,
+        cell_rect(cell),
+        [ix + 1.0, iy + 1.0, image, image],
+        None,
+    );
     draw.text(&footer, [x, iy + image + 5.0], TEXT_GRAY, true);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// A placed shulker box's own screen, tinted like the box
+// ---------------------------------------------------------------------------------------------
+
+/// The colour of the shulker box the player last right-clicked, `0xRRGGBB`; None after a click
+/// on anything else.
+static OPENED: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The vanilla shulker box screen: 176 x 166, 3 x 9 box slots, then the inventory and hotbar.
+const SCREEN_W: f32 = 176.0;
+const SCREEN_H: f32 = 166.0;
+/// Top-left of each 9-wide slot row block (the slot frame, one pixel outside the item), rows.
+const SCREEN_GRIDS: [(f32, f32, usize); 3] = [(7.0, 17.0, 3), (7.0, 83.0, 3), (7.0, 141.0, 1)];
+
+/// The tint of the open screen, when it is a placed shulker box's of 176 x 166.
+fn shulker_screen(screen: &mod_api::ScreenView<'_>) -> Option<([f32; 2], u32)> {
+    if screen.menu != Some("minecraft:shulker_box") {
+        return None;
+    }
+    let [x, y, w, h] = screen.rect;
+    if (w - SCREEN_W).abs() > 0.5 || (h - SCREEN_H).abs() > 0.5 {
+        return None;
+    }
+    let color = (*OPENED.lock().unwrap_or_else(|p| p.into_inner()))?;
+    Some(([x, y], soften(color)))
+}
+
+/// Whether labels on a face of this tint want white text.
+fn dark_face(tint: u32) -> bool {
+    let face = mul(0xC6, tint);
+    let luma = ((face >> 16) & 0xFF) * 3 + ((face >> 8) & 0xFF) * 6 + (face & 0xFF);
+    luma <= 1300
+}
 
 // ---------------------------------------------------------------------------------------------
 // The mod
@@ -664,6 +704,19 @@ impl Hooks for UniversalViewer {
                 if let Some(map) = cache.maps.get_mut(&id) {
                     map.seen = tick;
                 }
+                // The game's own copy first: no server help needed.
+                let after = if cache.maps.contains_key(&id) {
+                    cache.vanilla.get(&id).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                if let Some((version, colors)) = vanilla_colors(id, after) {
+                    cache.store(id, &colors);
+                    cache.vanilla.insert(id, version);
+                }
+                if cache.vanilla.contains_key(&id) && cache.maps.contains_key(&id) {
+                    continue;
+                }
                 if asks.len() >= ASKS_PER_TICK || asks.contains(&id) {
                     continue;
                 }
@@ -700,6 +753,76 @@ impl Hooks for UniversalViewer {
                 let _ = token.send(host, &MapRequest { id: VarInt(id) });
             }
         }
+    }
+
+    /// Remembers the colour of a shulker box the player right-clicks, for its screen.
+    fn right_click_block(&self, host: HostSide, event: &mut RightClickBlockEvent<'_>) -> Flow {
+        let HostSide::Client(host) = host else {
+            return Flow::Continue;
+        };
+        let dimension = match event.click.dimension {
+            LevelDimension::Overworld => "minecraft:overworld",
+            LevelDimension::Nether => "minecraft:the_nether",
+            LevelDimension::End => "minecraft:the_end",
+            _ => {
+                *OPENED.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                return Flow::Continue;
+            }
+        };
+        let color = host
+            .level(dimension)
+            .and_then(|level| level.block(&*host as &dyn mod_api::Host, event.click.pos))
+            .and_then(|block| host.block_item(block))
+            .map(|item| color_of(&*host, item, "shulker_box", PLAIN_SHULKER, 0))
+            .filter(|color| *color != 0);
+        *OPENED.lock().unwrap_or_else(|p| p.into_inner()) = color;
+        Flow::Continue
+    }
+
+    /// Repaints a placed shulker box's screen panel and slots in the box's colour, under its
+    /// items and labels.
+    fn screen_render_background(&self, _: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
+        let Some(([x, y], tint)) = shulker_screen(event.screen) else {
+            return;
+        };
+        let draw = &mut *event.draw;
+        let black = 0xFF00_0000;
+        let (face, light, dark) = (mul(0xC6, tint), mul(0xFF, tint), mul(0x55, tint));
+        let (w, h) = (SCREEN_W, SCREEN_H);
+        draw.fill([x + 1.0, y, w - 2.0, 1.0], black);
+        draw.fill([x + 1.0, y + h - 1.0, w - 2.0, 1.0], black);
+        draw.fill([x, y + 1.0, 1.0, h - 2.0], black);
+        draw.fill([x + w - 1.0, y + 1.0, 1.0, h - 2.0], black);
+        draw.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], face);
+        draw.fill([x + 1.0, y + 1.0, w - 4.0, 2.0], light);
+        draw.fill([x + 1.0, y + 1.0, 2.0, h - 4.0], light);
+        draw.fill([x + 3.0, y + h - 3.0, w - 4.0, 2.0], dark);
+        draw.fill([x + w - 3.0, y + 3.0, 2.0, h - 4.0], dark);
+        for (gx, gy, rows) in SCREEN_GRIDS {
+            for row in 0..rows {
+                for column in 0..COLUMNS {
+                    let sx = x + gx + column as f32 * SLOT;
+                    let sy = y + gy + row as f32 * SLOT;
+                    vanilla_slot(draw, sx, sy, tint);
+                }
+            }
+        }
+    }
+
+    /// On a dark box, writes the screen's labels again in white so they stay readable.
+    fn screen_render_foreground(&self, host: &dyn ClientHost, event: &mut ScreenRenderForegroundEvent<'_>) {
+        let Some(([x, y], tint)) = shulker_screen(event.screen) else {
+            return;
+        };
+        if !dark_face(tint) {
+            return;
+        }
+        let title = event.screen.title.map(|t| plain(host, t)).unwrap_or_default();
+        let inventory = host
+            .translate("container.inventory")
+            .unwrap_or_else(|| "Inventory".to_string());
+        event.draw.text(&title, [x + 8.0, y + 6.0], TEXT_WHITE, true);
+        event.draw.text(&inventory, [x + 8.0, y + 72.0], TEXT_WHITE, true);
     }
 
     /// A hint on things that hold items, so the Shift trick is discoverable.
@@ -745,22 +868,15 @@ impl Hooks for UniversalViewer {
         match view {
             View::Contents(contents) => draw_contents(draw, cursor, screen, &title, &contents),
             View::Map(id) => {
-                let state = with_cache(|cache| {
+                let cell = with_cache(|cache| {
                     cache.hovered = Some(id);
-                    if let Some(cell) = cache.ready(id) {
-                        return MapState::Ready(cell);
-                    }
-                    if cache.maps.contains_key(&id) {
-                        return MapState::Loading;
-                    }
-                    match cache.requested.get(&id) {
-                        Some(at) if cache.tick.saturating_sub(*at) > GIVE_UP_TICKS => {
-                            MapState::Unavailable
-                        }
-                        _ => MapState::Loading,
-                    }
+                    cache.ready(id)
                 });
-                draw_map(draw, cursor, screen, &title, id, state);
+                // Until the picture is here, the vanilla tooltip stays.
+                let Some(cell) = cell else {
+                    return Flow::Continue;
+                };
+                draw_map(draw, cursor, screen, &title, id, cell);
             }
         }
         Flow::Cancel

@@ -1,7 +1,7 @@
 id = "universal_viewer"
 name = "Universal Viewer"
-version = "0.1.6"
-description = "Preview maps in the tooltip, and see inside shulker boxes, bundles and any item that holds items by holding Shift while hovering."
+version = "0.1.7"
+description = "Map pictures on slot icons and in the tooltip; see inside shulker boxes and bundles by holding Shift; placed shulker boxes open in their own colour."
 authors = []
 license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.
@@ -14,3 +14,15 @@ capabilities = ["registries"]
 game = "26.3"
 horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
+
+# Client side, any server: copy the map pictures a vanilla server sends
+# (ClientboundMapItemDataPacket) so maps show without the mod on the server.
+[[native.mixin]]
+id = "vanilla_map"
+target = "horizon_client::game::maps::Game<'_>::remote_map_item_data"
+kind = "HEAD"
+helper = "src/mixins/vanilla_map.rs"
+bindings = [
+  { name = "game", ty = "&Game<'_>", value = "&*self" },
+  { name = "p", ty = "&horizon_protocol::packets::play::MapItemData", value = "p" },
+]
