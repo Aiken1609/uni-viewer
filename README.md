@@ -50,13 +50,8 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 | Lihat isi shulker box atau bundle | Tahan `Shift` sambil hover |
 | Shulker box berwarna saat dibuka | Klik kanan shulker box yang ditaruh |
 
-<<<<<<< HEAD
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Tidak ada keybind
 atau pengaturan tambahan.
-=======
-- Pinned to Horizon build `0b14f8acfd97fa2c750e42795249dcc981178ca4` (see `horizon-mod.toml`). The map mixin targets that build's code, so a newer Horizon needs the pin moved (`cargo horizon-mod update`) and the mod rebuilt.
-- The placed shulker box tint follows the vanilla 176 x 166 screen layout; a resource pack that moves its slots will not line up.
->>>>>>> e95022bc6f59aed5c82c714e0971cec57cc93e75
 
 ## Batasan
 
@@ -64,7 +59,6 @@ atau pengaturan tambahan.
   atau di item frame dekat kamu. Map yang belum pernah dikirim tetap memakai ikon dan tooltip vanilla sampai datanya
   diterima. Di singleplayer, dan di server yang juga memasang mod ini, map di chest langsung tampil.
 - Maksimal 64 gambar map disimpan sekaligus. Map yang paling lama tidak terlihat diganti saat ada map baru.
-- Minecraft tidak mencatat siapa pembuat map, jadi tooltip tidak bisa menampilkannya.
 - Warna layar shulker yang ditaruh mengikuti tata letak layar vanilla (176 x 166). Resource pack yang memindahkan
   slotnya akan membuat warnanya tidak pas. Warna ditentukan dari blok yang kamu klik kanan, jadi shulker yang dibuka
   lewat command atau plugin tetap tampil vanilla.
