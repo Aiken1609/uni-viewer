@@ -89,6 +89,11 @@ struct CachedMap {
     written: u64,
     /// When it was last drawn (slot or tooltip), to pick a cell to reuse.
     seen: u64,
+    /// Whether its cell has been uploaded at least once: a refresh keeps showing the old
+    /// picture until the new one is up, instead of falling back to the vanilla icon.
+    shown: bool,
+    /// A hash of its colour ids, so an unchanged refresh writes and uploads nothing.
+    hash: u64,
 }
 
 #[derive(Default)]
@@ -117,11 +122,25 @@ impl Cache {
     /// Whether map `id`'s picture is in the uploaded atlas, and its cell.
     fn ready(&self, id: i32) -> Option<usize> {
         let map = self.maps.get(&id)?;
-        (map.written <= self.uploaded).then_some(map.cell)
+        (map.shown || map.written <= self.uploaded).then_some(map.cell)
     }
 
     /// Writes map `id`'s pixels into its cell, taking the least recently seen cell if it is new.
-    fn store(&mut self, id: i32, rgba: &[u8]) {
+    fn store(&mut self, id: i32, colors: &[u8]) {
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            colors.hash(&mut h);
+            h.finish()
+        };
+        let mut shown = false;
+        if let Some(map) = self.maps.get_mut(&id) {
+            if map.hash == hash {
+                return;
+            }
+            shown = map.shown || map.written <= self.uploaded;
+        }
+        let rgba = to_rgba(colors);
         if self.atlas.is_empty() {
             self.atlas = vec![0; ATLAS * ATLAS * 4];
         }
@@ -158,6 +177,8 @@ impl Cache {
                 cell,
                 written: self.generation,
                 seen,
+                shown,
+                hash,
             },
         );
     }
@@ -519,6 +540,9 @@ impl Hooks for UniversalViewer {
             {
                 cache.uploaded = cache.generation;
                 cache.last_upload = tick;
+                for map in cache.maps.values_mut() {
+                    map.shown = true;
+                }
             }
             asks
         });
@@ -687,8 +711,7 @@ fn on_map_data(data: MapData, _: &mut dyn IPayloadContext) -> Result<(), String>
         let Some((colors, _)) = cache.partial.remove(&id) else {
             return;
         };
-        let rgba = to_rgba(&colors);
-        cache.store(id, &rgba);
+        cache.store(id, &colors);
     });
     Ok(())
 }

@@ -1,6 +1,6 @@
 id = "universal_viewer"
 name = "Universal Viewer"
-version = "0.1.3"
+version = "0.1.4"
 description = "Preview maps in the tooltip, and see inside shulker boxes, bundles and any item that holds items by holding Shift while hovering."
 authors = []
 license = "MIT"
