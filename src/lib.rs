@@ -66,6 +66,27 @@ struct MapData {
     part: VarInt,
     /// `PART_LEN` map colour ids (`base * 4 + shade`), row by row.
     colors: Vec<u8>,
+    /// A map pixel is `1 << scale` blocks.
+    scale: VarInt,
+    /// Locked in a cartography table.
+    locked: bool,
+}
+
+/// What a map's tooltip says under its picture: its zoom and whether it is locked, per id.
+static INFO: Mutex<Option<HashMap<i32, (u8, bool)>>> = Mutex::new(None);
+
+/// Records map `id`'s zoom and lock, from a vanilla map packet (the `vanilla_map` mixin) or this
+/// mod's server.
+pub fn vanilla_map_info(id: i32, scale: i8, locked: bool) {
+    let scale = scale.clamp(0, 4) as u8;
+    INFO.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(id, (scale, locked));
+}
+
+fn map_info(id: i32) -> Option<(u8, bool)> {
+    INFO.lock().unwrap_or_else(|p| p.into_inner()).as_ref()?.get(&id).copied()
 }
 
 /// A payload list holds at most 4096 entries, so a 128x128 map goes in four slices.
@@ -540,8 +561,6 @@ fn draw_contents(
 
 /// The paper a map is drawn on, under its unexplored (transparent) pixels.
 const MAP_PAPER: u32 = 0xFFDD_D0B0;
-/// Width of the parchment frame around a hovered map, in GUI pixels (four 2 px bands).
-const FRAME: f32 = 8.0;
 
 /// A fixed pseudo-random number for `(a, b)`, so the torn edge never flickers.
 fn noise(a: u32, b: u32) -> u32 {
@@ -562,30 +581,83 @@ fn tear(side: u32, i: u32) -> u32 {
 const FRAME_PAPER: u32 = 0xFFD5_BE93;
 const FRAME_RIM: u32 = 0xFF8E_7D5B;
 
-/// The hovered map as it looks held in hand: the picture inside a parchment frame, its name over
-/// it.
-fn draw_map(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], title: &str, cell: usize) {
+/// Vanilla's tooltip colours: the panel the map sits in.
+const TIP_BACKGROUND: u32 = 0xF010_0010;
+const TIP_TOP: u32 = 0xF050_00FF;
+const TIP_BOTTOM: u32 = 0xF028_007F;
+/// Vanilla's gray tooltip lore.
+const TEXT_GRAY: u32 = 0xFFAA_AAAA;
+/// Vanilla's frame around a held map: 7 px of `map_background` around the 128 px picture.
+const HELD_FRAME: f32 = 7.0;
+const MAP_BACKGROUND: &str = "map/map_background";
+
+/// The hovered map in a vanilla tooltip: its name, the picture in the held-map frame, then its
+/// id, zoom and lock.
+fn draw_map(
+    host: &dyn ClientHost,
+    draw: &mut dyn DrawContext,
+    cursor: [i32; 2],
+    screen: [i32; 2],
+    title: &str,
+    id: i32,
+    cell: usize,
+) {
     let image = MAP_SIZE as f32 * MAP_SCALE;
-    let outer = image + FRAME * 2.0;
-    let (w, h) = (outer.max(draw.text_width(title)), 11.0 + outer);
+    let outer = image + HELD_FRAME * 2.0;
+    let mut lines = vec![format!("Map #{id}")];
+    if let Some((scale, locked)) = map_info(id) {
+        lines.push(format!("Scale 1:{}", 1u32 << scale));
+        lines.push(if locked { "Locked" } else { "Unlocked" }.to_string());
+    }
+    let mut w = outer.max(draw.text_width(title));
+    for line in &lines {
+        w = w.max(draw.text_width(line));
+    }
+    let h = 12.0 + outer + 3.0 + lines.len() as f32 * 10.0;
+
+    // Placed like vanilla's tooltip: right of the cursor, flipped and clamped at the edges.
     let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
     let (sw, sh) = (screen[0] as f32, screen[1] as f32);
     let mut x = cx + 12.0;
-    if x + w + 2.0 > sw {
-        x = cx - 12.0 - w;
+    if x + w + 4.0 > sw {
+        x = cx - 16.0 - w;
     }
-    x = x.max(2.0);
+    x = x.max(4.0);
     let mut y = cy - 12.0;
-    if y + h + 2.0 > sh {
-        y = sh - h - 2.0;
+    if y + h + 4.0 > sh {
+        y = sh - h - 4.0;
     }
-    y = y.max(2.0);
+    y = y.max(4.0);
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], TIP_BACKGROUND);
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], TIP_TOP);
+    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], TIP_BOTTOM);
+    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
+    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
 
     draw.text(title, [x, y], TEXT_WHITE, true);
-    let (fx, fy) = (x, y + 11.0);
-    // A sheet of paper with torn edges, in 2 x 2 blocks: each block is cut away, rim, or paper by
-    // how far it is from the nearest side against how deep that side is torn there.
-    let blocks = (outer / 2.0) as u32;
+    let fx = x + ((w - outer) / 2.0).floor();
+    let fy = y + 12.0;
+    // The game's own `map_background` (so a resource pack's shows too), else a drawn one.
+    let frame = Identifier::parse("minecraft:map/map_background")
+        .ok()
+        .and_then(|sprite| host.gui_sprite(&sprite));
+    let drawn = frame.is_some_and(|region| {
+        let [sw, sh] = region.size;
+        draw.sprite(MAP_BACKGROUND, [0.0, 0.0, sw as f32, sh as f32], [fx, fy, outer, outer], None)
+    });
+    if !drawn {
+        draw_torn_frame(draw, fx, fy, outer);
+    }
+    let (ix, iy) = (fx + HELD_FRAME, fy + HELD_FRAME);
+    draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [ix, iy, image, image], None);
+    for (i, line) in lines.iter().enumerate() {
+        draw.text(line, [x, fy + outer + 3.0 + i as f32 * 10.0], TEXT_GRAY, true);
+    }
+}
+
+/// A sheet of paper with torn edges, `size` square, for when the game has no `map_background`.
+fn draw_torn_frame(draw: &mut dyn DrawContext, fx: f32, fy: f32, size: f32) {
+    let blocks = (size / 2.0) as u32;
     let last = blocks - 1;
     for by in 0..blocks {
         for bx in 0..blocks {
@@ -606,10 +678,7 @@ fn draw_map(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], titl
             }
         }
     }
-    let (ix, iy) = (fx + FRAME, fy + FRAME);
-    draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [ix, iy, image, image], None);
 }
-
 
 // ---------------------------------------------------------------------------------------------
 // A placed shulker box's own screen, tinted like the box
@@ -865,7 +934,7 @@ impl Hooks for UniversalViewer {
                 let Some(cell) = cell else {
                     return Flow::Continue;
                 };
-                draw_map(draw, cursor, screen, &title, cell);
+                draw_map(host, draw, cursor, screen, &title, id, cell);
             }
         }
         Flow::Cancel
@@ -904,7 +973,7 @@ impl ItemPart for MapIcon {
 /// Never returns an error: a failed handler disconnects the player.
 fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
     let id = request.id.0;
-    let colors = {
+    let state = {
         let Ok(host) = cx.server_host() else {
             return Ok(());
         };
@@ -912,11 +981,12 @@ fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(
         let Some(level) = host.level("minecraft:overworld") else {
             return Ok(());
         };
-        level.map_data(host, id).map(|state| state.colors)
+        level.map_data(host, id)
     };
-    let Some(colors) = colors else {
+    let Some(state) = state else {
         return Ok(());
     };
+    let (scale, locked, colors) = (state.scale, state.locked, state.colors);
     if colors.len() != MAP_SIZE * MAP_SIZE {
         return Ok(());
     }
@@ -928,6 +998,8 @@ fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(
             id: VarInt(id),
             part: VarInt(part as i32),
             colors: slice.to_vec(),
+            scale: VarInt(i32::from(scale)),
+            locked,
         };
         if token.reply(cx, &data).is_err() {
             break;
@@ -944,6 +1016,7 @@ fn on_map_data(data: MapData, _: &mut dyn IPayloadContext) -> Result<(), String>
         return Ok(());
     }
     let part = part as usize;
+    vanilla_map_info(id, data.scale.0.clamp(0, 4) as i8, data.locked);
     with_cache(|cache| {
         let (colors, got) = cache
             .partial

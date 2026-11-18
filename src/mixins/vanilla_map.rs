@@ -1,4 +1,5 @@
 fn vanilla_map(game: &Game<'_>, p: &horizon_protocol::packets::play::MapItemData) {
+    mod_universal_viewer::vanilla_map_info(p.map_id, p.scale, p.locked);
     // Decoration-only updates change no pixel.
     let Some(patch) = &p.patch else {
         return;
