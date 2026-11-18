@@ -37,7 +37,6 @@ This writes `target/horizon-mod/universal_viewer.hmod`; put it in the instance's
 ## Notes
 
 - Pinned to Horizon build `0b14f8acfd97fa2c750e42795249dcc981178ca4` (see `horizon-mod.toml`). The map mixin targets that build's code, so a newer Horizon needs the pin moved (`cargo horizon-mod update`) and the mod rebuilt.
-- Maps do not record who made them, so the tooltip cannot show a creator.
 - The placed shulker box tint follows the vanilla 176 x 166 screen layout; a resource pack that moves its slots will not line up.
 
 ## License
