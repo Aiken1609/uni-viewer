@@ -1,7 +1,7 @@
 //! Universal Viewer: look inside things without opening them.
 //!
-//! * **Maps** show their picture in the tooltip as soon as you hover them (inventory, chests,
-//!   creative tabs...). No key needed.
+//! * **Maps** show their picture right on their slot icon, and a bigger one in the tooltip when
+//!   hovered (inventory, chests, creative tabs...). No key needed.
 //! * **Shulker boxes** (and any other stack that carries `minecraft:container`) and **bundles**
 //!   (`minecraft:bundle_contents`) show their whole contents as a slot grid while Shift is held.
 //!
@@ -11,12 +11,13 @@
 //! the answer. On a server without this mod the map panel says so instead of drawing.
 
 use mod_api::{
-    ClientHost, ClientTickPreEvent, DrawContext, Flow, Hooks, IPayloadContext, ItemStack,
+    ClientHost, ClientTickPreEvent, DrawContext, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
+    ItemPart, ItemStack,
     PayloadCodec, PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
     RenderTooltipPreEvent, Tag, Text, ToClient, ToServer, TooltipElement, VarInt,
 };
 use mod_api::text::TextContent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------------------------
@@ -37,6 +38,16 @@ const COLUMNS: usize = 9;
 const REFRESH_TICKS: u64 = 100;
 /// Ticks after a request with no answer before the panel says the server can't provide it.
 const GIVE_UP_TICKS: u64 = 60;
+/// Ticks before a map shown only on its slot icon is asked for again.
+const ICON_REFRESH_TICKS: u64 = 400;
+/// At most this many map requests go out per tick (a chest full of maps opens gradually).
+const ASKS_PER_TICK: usize = 4;
+/// Ticks between two uploads of the map atlas.
+const UPLOAD_EVERY: u64 = 4;
+/// The mod-image slot is 1024 x 1024 pixels: an 8 x 8 grid of 128 px maps.
+const ATLAS: usize = 1024;
+const CELLS_PER_ROW: usize = ATLAS / MAP_SIZE;
+const CELLS: usize = CELLS_PER_ROW * CELLS_PER_ROW;
 
 const TEXT_WHITE: u32 = 0xFFFF_FFFF;
 const TEXT_GRAY: u32 = 0xFFAA_AAAA;
@@ -53,9 +64,15 @@ struct MapRequest {
 #[derive(Debug, PartialEq, PayloadCodec)]
 struct MapData {
     id: VarInt,
-    /// `128 * 128` map colour ids (`base * 4 + shade`), row by row.
+    /// Which slice of the picture this is, `0..PARTS`.
+    part: VarInt,
+    /// `PART_LEN` map colour ids (`base * 4 + shade`), row by row.
     colors: Vec<u8>,
 }
+
+/// A payload list holds at most 4096 entries, so a 128x128 map goes in four slices.
+const PART_LEN: usize = 4096;
+const PARTS: usize = MAP_SIZE * MAP_SIZE / PART_LEN;
 
 static REQUEST: Mutex<Option<ToServer<MapRequest>>> = Mutex::new(None);
 static REPLY: Mutex<Option<ToClient<MapData>>> = Mutex::new(None);
@@ -64,9 +81,14 @@ static REPLY: Mutex<Option<ToClient<MapData>>> = Mutex::new(None);
 // Client state
 // ---------------------------------------------------------------------------------------------
 
+/// A map whose picture is in the atlas.
 struct CachedMap {
-    rgba: Vec<u8>,
-    fetched: u64,
+    /// Its cell of the atlas grid.
+    cell: usize,
+    /// The atlas generation that wrote it; it shows once an upload at least that new happened.
+    written: u64,
+    /// When it was last drawn (slot or tooltip), to pick a cell to reuse.
+    seen: u64,
 }
 
 #[derive(Default)]
@@ -77,9 +99,75 @@ struct Cache {
     /// When each map was last asked for.
     requested: HashMap<i32, u64>,
     /// The map whose tooltip was drawn since the last tick.
-    wanted: Option<i32>,
-    /// The map (and the fetch of it) currently in the atlas slot.
-    uploaded: Option<(i32, u64)>,
+    hovered: Option<i32>,
+    /// Maps drawn on slot icons since the last tick.
+    on_slots: HashSet<i32>,
+    /// Maps still arriving: their colour ids so far and which slices came.
+    partial: HashMap<i32, (Vec<u8>, u8)>,
+    /// All map pictures, `ATLAS * ATLAS` RGBA pixels; empty until the first map arrives.
+    atlas: Vec<u8>,
+    /// Bumped on every write into `atlas`.
+    generation: u64,
+    /// The generation last uploaded into the mod-image slot.
+    uploaded: u64,
+    last_upload: u64,
+}
+
+impl Cache {
+    /// Whether map `id`'s picture is in the uploaded atlas, and its cell.
+    fn ready(&self, id: i32) -> Option<usize> {
+        let map = self.maps.get(&id)?;
+        (map.written <= self.uploaded).then_some(map.cell)
+    }
+
+    /// Writes map `id`'s pixels into its cell, taking the least recently seen cell if it is new.
+    fn store(&mut self, id: i32, rgba: &[u8]) {
+        if self.atlas.is_empty() {
+            self.atlas = vec![0; ATLAS * ATLAS * 4];
+        }
+        let cell = match self.maps.get(&id) {
+            Some(map) => map.cell,
+            None => {
+                let used: HashSet<usize> = self.maps.values().map(|m| m.cell).collect();
+                match (0..CELLS).find(|cell| !used.contains(cell)) {
+                    Some(free) => free,
+                    None => {
+                        let (&old, map) = self
+                            .maps
+                            .iter()
+                            .min_by_key(|(_, m)| m.seen)
+                            .expect("all cells are in use");
+                        let cell = map.cell;
+                        self.maps.remove(&old);
+                        cell
+                    }
+                }
+            }
+        };
+        let (cx, cy) = (cell % CELLS_PER_ROW, cell / CELLS_PER_ROW);
+        let row = MAP_SIZE * 4;
+        for y in 0..MAP_SIZE {
+            let at = ((cy * MAP_SIZE + y) * ATLAS + cx * MAP_SIZE) * 4;
+            self.atlas[at..at + row].copy_from_slice(&rgba[y * row..(y + 1) * row]);
+        }
+        self.generation += 1;
+        let seen = self.tick;
+        self.maps.insert(
+            id,
+            CachedMap {
+                cell,
+                written: self.generation,
+                seen,
+            },
+        );
+    }
+}
+
+/// The source rectangle of atlas cell `cell`.
+fn cell_rect(cell: usize) -> [f32; 4] {
+    let size = MAP_SIZE as f32;
+    let (cx, cy) = (cell % CELLS_PER_ROW, cell / CELLS_PER_ROW);
+    [cx as f32 * size, cy as f32 * size, size, size]
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
@@ -313,7 +401,8 @@ fn draw_contents(
 
 /// What the map panel can show right now.
 enum MapState {
-    Ready,
+    /// In the atlas, at this cell.
+    Ready(usize),
     Loading,
     Unavailable,
 }
@@ -342,11 +431,10 @@ fn draw_map(
     draw.fill([ix, iy, image + 2.0, image + 2.0], 0xFF00_0000);
     draw.fill([ix + 1.0, iy + 1.0, image, image], 0xFFD1_B380);
     match state {
-        MapState::Ready => {
-            let size = MAP_SIZE as f32;
+        MapState::Ready(cell) => {
             draw.sprite(
                 MOD_IMAGE_SPRITE,
-                [0.0, 0.0, size, size],
+                cell_rect(cell),
                 [ix + 1.0, iy + 1.0, image, image],
                 None,
             );
@@ -362,43 +450,6 @@ fn draw_map(
     draw.text(&footer, [x, iy + image + 5.0], TEXT_GRAY, true);
 }
 
-
-/// Lines for the Ctrl+Shift debug panel.
-fn debug_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<String> {
-    let mut lines = vec![
-        "Universal Viewer debug (hook is running)".to_string(),
-        format!("count: {}", stack.count()),
-    ];
-    match stack.components().map(|c| c.as_nbt()) {
-        None => lines.push("components: none (no patch on this stack)".to_string()),
-        Some(patch) => {
-            lines.push(format!("components: {}", patch.len()));
-            for key in patch.keys().take(10) {
-                lines.push(format!("  {}", key.to_string_lossy()));
-            }
-        }
-    }
-    let kind = match view_of(host, stack, true) {
-        Some(View::Map(id)) => format!("view: map #{id}"),
-        Some(View::Contents(c)) => format!("view: contents, {} slots", c.slots.len()),
-        None => "view: none".to_string(),
-    };
-    lines.push(kind);
-    lines
-}
-
-fn draw_debug(draw: &mut dyn DrawContext, cursor: [i32; 2], screen: [i32; 2], lines: &[String]) {
-    let w = lines
-        .iter()
-        .map(|line| draw.text_width(line))
-        .fold(0.0_f32, f32::max);
-    let h = lines.len() as f32 * 10.0;
-    let [x, y] = panel(draw, cursor, screen, w, h);
-    for (index, line) in lines.iter().enumerate() {
-        let color = if index == 0 { TEXT_WHITE } else { TEXT_GRAY };
-        draw.text(line, [x, y + index as f32 * 10.0], color, true);
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // The mod
@@ -425,51 +476,60 @@ impl Hooks for UniversalViewer {
             on_map_request,
         );
         *REQUEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
+
+        // The picture on the slot icon of every filled map.
+        let map = r.item_key("minecraft:filled_map");
+        r.item_part(map, MapIcon);
     }
 
-    /// Once a tick: put the hovered map in the atlas slot, or ask the server for it.
+    /// Once a tick: ask the server for the maps on screen, and upload the atlas when it changed.
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _: &mut ClientTickPreEvent) {
-        enum Step {
-            Nothing,
-            Upload(i32, u64, Vec<u8>),
-            Ask(i32),
-        }
-        let step = with_cache(|cache| {
+        let asks = with_cache(|cache| {
             cache.tick += 1;
-            let Some(id) = cache.wanted.take() else {
-                return Step::Nothing;
-            };
-            let asked = cache.requested.get(&id).copied();
-            let due = asked.is_none_or(|at| cache.tick.saturating_sub(at) > REFRESH_TICKS);
-            match cache.maps.get(&id) {
-                Some(map) if cache.uploaded != Some((id, map.fetched)) => {
-                    Step::Upload(id, map.fetched, map.rgba.clone())
+            let tick = cache.tick;
+            let hovered = cache.hovered.take();
+            let on_slots = std::mem::take(&mut cache.on_slots);
+            let mut asks = Vec::new();
+            // The hovered map first, refreshed more often, then the slot icons.
+            let wanted = hovered
+                .iter()
+                .map(|id| (*id, REFRESH_TICKS))
+                .chain(on_slots.iter().map(|id| (*id, ICON_REFRESH_TICKS)));
+            for (id, refresh) in wanted {
+                if let Some(map) = cache.maps.get_mut(&id) {
+                    map.seen = tick;
                 }
-                Some(_) if due => {
-                    cache.requested.insert(id, cache.tick);
-                    Step::Ask(id)
+                if asks.len() >= ASKS_PER_TICK || asks.contains(&id) {
+                    continue;
                 }
-                Some(_) => Step::Nothing,
-                None if due => {
-                    cache.requested.insert(id, cache.tick);
-                    Step::Ask(id)
+                let have = cache.maps.contains_key(&id);
+                let wait = if have { refresh } else { REFRESH_TICKS };
+                let due = cache
+                    .requested
+                    .get(&id)
+                    .is_none_or(|at| tick.saturating_sub(*at) > wait);
+                if due {
+                    cache.requested.insert(id, tick);
+                    asks.push(id);
                 }
-                None => Step::Nothing,
             }
+            if cache.generation > cache.uploaded
+                && tick.saturating_sub(cache.last_upload) >= UPLOAD_EVERY
+                && host.mod_image(ATLAS as u32, ATLAS as u32, &cache.atlas)
+            {
+                cache.uploaded = cache.generation;
+                cache.last_upload = tick;
+            }
+            asks
         });
-        match step {
-            Step::Nothing => {}
-            Step::Upload(id, fetched, rgba) => {
-                if host.mod_image(MAP_SIZE as u32, MAP_SIZE as u32, &rgba) {
-                    with_cache(|cache| cache.uploaded = Some((id, fetched)));
-                }
-            }
-            Step::Ask(id) => {
-                let token = REQUEST.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                if let Some(token) = token {
-                    // An unsupported peer (a server without the mod) just never answers.
-                    let _ = token.send(host, &MapRequest { id: VarInt(id) });
-                }
+        if asks.is_empty() {
+            return;
+        }
+        let token = REQUEST.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(token) = token {
+            for id in asks {
+                // An unsupported peer (a server without the mod) just never answers.
+                let _ = token.send(host, &MapRequest { id: VarInt(id) });
             }
         }
     }
@@ -498,15 +558,6 @@ impl Hooks for UniversalViewer {
         };
         let modifiers = host.modifiers();
         let shift = modifiers.shift();
-        if shift && modifiers.control() {
-            // Debug panel (Ctrl+Shift while hovering any item): proves the hook runs and shows
-            // which components the stack carries.
-            let cursor = [event.place.x, event.place.y];
-            let screen = [event.screen_width, event.screen_height];
-            let lines = debug_lines(host, stack);
-            draw_debug(&mut *event.draw, cursor, screen, &lines);
-            return Flow::Cancel;
-        }
         let Some(view) = view_of(host, stack, shift) else {
             return Flow::Continue;
         };
@@ -526,17 +577,18 @@ impl Hooks for UniversalViewer {
             View::Contents(contents) => draw_contents(draw, cursor, screen, &title, &contents),
             View::Map(id) => {
                 let state = with_cache(|cache| {
-                    cache.wanted = Some(id);
-                    let live = cache.maps.get(&id).map(|map| map.fetched);
-                    match live {
-                        Some(fetched) if cache.uploaded == Some((id, fetched)) => MapState::Ready,
-                        Some(_) => MapState::Loading,
-                        None => match cache.requested.get(&id) {
-                            Some(at) if cache.tick.saturating_sub(*at) > GIVE_UP_TICKS => {
-                                MapState::Unavailable
-                            }
-                            _ => MapState::Loading,
-                        },
+                    cache.hovered = Some(id);
+                    if let Some(cell) = cache.ready(id) {
+                        return MapState::Ready(cell);
+                    }
+                    if cache.maps.contains_key(&id) {
+                        return MapState::Loading;
+                    }
+                    match cache.requested.get(&id) {
+                        Some(at) if cache.tick.saturating_sub(*at) > GIVE_UP_TICKS => {
+                            MapState::Unavailable
+                        }
+                        _ => MapState::Loading,
                     }
                 });
                 draw_map(draw, cursor, screen, &title, id, state);
@@ -546,17 +598,50 @@ impl Hooks for UniversalViewer {
     }
 }
 
+/// Draws a filled map's picture over its slot icon, once the picture is here.
+#[derive(Default)]
+pub struct MapIcon;
+
+#[mod_api::horizon_part]
+impl ItemPart for MapIcon {
+    fn item_decorations(&self, host: &dyn ClientHost, event: &mut ItemDecorationsEvent<'_>) {
+        let Some(View::Map(id)) = view_of(host, event.stack, false) else {
+            return;
+        };
+        let cell = with_cache(|cache| {
+            cache.on_slots.insert(id);
+            cache.ready(id)
+        });
+        let Some(cell) = cell else {
+            return;
+        };
+        let (x, y) = (event.x, event.y);
+        // Paper edge, then the picture, over the vanilla icon.
+        event.draw.fill([x, y, 16.0, 16.0], 0xFFD1_B380);
+        event.draw.fill([x, y, 16.0, 1.0], 0xFF8A_6A3A);
+        event.draw.fill([x, y + 15.0, 16.0, 1.0], 0xFF8A_6A3A);
+        event.draw.fill([x, y, 1.0, 16.0], 0xFF8A_6A3A);
+        event.draw.fill([x + 15.0, y, 1.0, 16.0], 0xFF8A_6A3A);
+        event.draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x + 1.0, y + 1.0, 14.0, 14.0], None);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Payload handlers
 // ---------------------------------------------------------------------------------------------
 
-/// Server: a client wants map `id`. Answer with its colours when the world has it.
+/// Server: a client wants map `id`. Answer with its colours, in slices, when the world has it.
+/// Never returns an error: a failed handler disconnects the player.
 fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
     let id = request.id.0;
     let colors = {
-        let host = cx.server_host().map_err(|e| format!("no server host: {e:?}"))?;
+        let Ok(host) = cx.server_host() else {
+            return Ok(());
+        };
         // Maps belong to the world, so any level reaches them.
-        let level = host.level("minecraft:overworld").ok_or("no overworld")?;
+        let Some(level) = host.level("minecraft:overworld") else {
+            return Ok(());
+        };
         level.map_data(host, id).map(|state| state.colors)
     };
     let Some(colors) = colors else {
@@ -565,36 +650,45 @@ fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(
     if colors.len() != MAP_SIZE * MAP_SIZE {
         return Ok(());
     }
-    let token = REPLY
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .ok_or("reply token missing")?;
-    token
-        .reply(
-            cx,
-            &MapData {
-                id: VarInt(id),
-                colors,
-            },
-        )
-        .map(|_| ())
-        .map_err(|e| format!("map reply: {e:?}"))
+    let Some(token) = REPLY.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+        return Ok(());
+    };
+    for (part, slice) in colors.chunks(PART_LEN).enumerate() {
+        let data = MapData {
+            id: VarInt(id),
+            part: VarInt(part as i32),
+            colors: slice.to_vec(),
+        };
+        if token.reply(cx, &data).is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
-/// Client: the server sent a map's colours. Keep them as RGBA until it is hovered.
+/// Client: one slice of a map's colours. Once all slices are in, keep the picture as RGBA.
 fn on_map_data(data: MapData, _: &mut dyn IPayloadContext) -> Result<(), String> {
-    if data.colors.len() != MAP_SIZE * MAP_SIZE {
-        return Err(format!("map {} has {} pixels", data.id.0, data.colors.len()));
+    let id = data.id.0;
+    let part = data.part.0;
+    if part < 0 || part as usize >= PARTS || data.colors.len() != PART_LEN {
+        return Ok(());
     }
-    let rgba = to_rgba(&data.colors);
+    let part = part as usize;
     with_cache(|cache| {
-        let fetched = cache.tick;
-        cache.maps.insert(data.id.0, CachedMap { rgba, fetched });
-        // Make sure a changed picture is uploaded again even in the same tick.
-        if cache.uploaded.is_some_and(|(id, _)| id == data.id.0) {
-            cache.uploaded = None;
+        let (colors, got) = cache
+            .partial
+            .entry(id)
+            .or_insert_with(|| (vec![0; MAP_SIZE * MAP_SIZE], 0));
+        colors[part * PART_LEN..(part + 1) * PART_LEN].copy_from_slice(&data.colors);
+        *got |= 1 << part;
+        if *got as usize != (1 << PARTS) - 1 {
+            return;
         }
+        let Some((colors, _)) = cache.partial.remove(&id) else {
+            return;
+        };
+        let rgba = to_rgba(&colors);
+        cache.store(id, &rgba);
     });
     Ok(())
 }
