@@ -25,7 +25,7 @@ A [Horizon](https://github.com/horizon-rust/horizon) mod (Minecraft 26.3 in Rust
 
 ## License
 
-MIT
+MIT [LICENSE](https://github.com/Aiken1609/uni-viewer/blob/c630ea4c1a7042f2334837cf777a718cce42c096/LICENSE)
 
 ---
 
