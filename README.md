@@ -50,8 +50,13 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 | Lihat isi shulker box atau bundle | Tahan `Shift` sambil hover |
 | Shulker box berwarna saat dibuka | Klik kanan shulker box yang ditaruh |
 
+<<<<<<< HEAD
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Tidak ada keybind
 atau pengaturan tambahan.
+=======
+- Pinned to Horizon build `0b14f8acfd97fa2c750e42795249dcc981178ca4` (see `horizon-mod.toml`). The map mixin targets that build's code, so a newer Horizon needs the pin moved (`cargo horizon-mod update`) and the mod rebuilt.
+- The placed shulker box tint follows the vanilla 176 x 166 screen layout; a resource pack that moves its slots will not line up.
+>>>>>>> e95022bc6f59aed5c82c714e0971cec57cc93e75
 
 ## Batasan
 
