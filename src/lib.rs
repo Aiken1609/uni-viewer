@@ -148,7 +148,8 @@ impl Cache {
     }
 
     /// Writes map `id`'s pixels into its cell, taking the least recently seen cell if it is new.
-    fn store(&mut self, id: i32, colors: &[u8]) {
+    /// False when the palette is not known yet (nothing stored; try again later).
+    fn store(&mut self, id: i32, colors: &[u8]) -> bool {
         let hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -158,11 +159,13 @@ impl Cache {
         let mut shown = false;
         if let Some(map) = self.maps.get_mut(&id) {
             if map.hash == hash {
-                return;
+                return true;
             }
             shown = map.shown || map.written <= self.uploaded;
         }
-        let rgba = to_rgba(colors);
+        let Some(rgba) = to_rgba(colors) else {
+            return false;
+        };
         if self.atlas.is_empty() {
             self.atlas = vec![0; ATLAS * ATLAS * 4];
         }
@@ -203,6 +206,7 @@ impl Cache {
                 hash,
             },
         );
+        true
     }
 }
 
@@ -245,33 +249,25 @@ fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
     f(guard.get_or_insert_with(Cache::default))
 }
 
-/// The vanilla map base colours (`MapColor`), `0xRRGGBB`, indexed by `colour id >> 2`.
-const BASE_COLORS: [u32; 62] = [
-    0x000000, 0x7FB238, 0xF7E9A3, 0xC7C7C7, 0xFF0000, 0xA0A0FF, 0xA7A7A7, 0x007C00, 0xFFFFFF,
-    0xA4A8B8, 0x976D4D, 0x707070, 0x4040FF, 0x8F7748, 0xFFFCF5, 0xD87F33, 0xB24CD8, 0x6699D8,
-    0xE5E533, 0x7FCC19, 0xF27FA5, 0x4C4C4C, 0x999999, 0x4C7F99, 0x7F3FB2, 0x334CB2, 0x664C33,
-    0x667F33, 0x993333, 0x191919, 0xFAEE4D, 0x5CDBD5, 0x4A80FF, 0x00D93A, 0x815631, 0x700200,
-    0xD1B1A1, 0x9F5224, 0x95576C, 0x706C8A, 0xBA8524, 0x677535, 0xA04D4E, 0x392923, 0x876B62,
-    0x575C5C, 0x7A4958, 0x4C3E5C, 0x4C3223, 0x4C522A, 0x8E3C2E, 0x251610, 0xBD3031, 0x943F61,
-    0x5C191D, 0x167E86, 0x3A8E8C, 0x562C3E, 0x14B485, 0x646464, 0xD8AF93, 0x7FA796,
-];
+/// The game's own map colours, RGBA for each of the 256 packed colour ids (`base * 4 + shade`),
+/// handed over by the `vanilla_map` mixin. Read at runtime: the mod ships no Minecraft data.
+static PALETTE: std::sync::OnceLock<Vec<[u8; 4]>> = std::sync::OnceLock::new();
 
-/// Map colour ids to RGBA bytes, as `MapColor.calculateARGBColor` shades them.
-fn to_rgba(colors: &[u8]) -> Vec<u8> {
-    const SHADE: [u32; 4] = [180, 220, 255, 135];
+/// Called by the `vanilla_map` mixin with the game's colour for each packed map colour id.
+pub fn vanilla_map_palette(table: &[[u8; 4]]) {
+    if table.len() == 256 {
+        let _ = PALETTE.set(table.to_vec());
+    }
+}
+
+/// `128 * 128` packed colour ids to RGBA, once the game's palette is known.
+fn to_rgba(colors: &[u8]) -> Option<Vec<u8>> {
+    let palette = PALETTE.get()?;
     let mut out = Vec::with_capacity(colors.len() * 4);
     for &id in colors {
-        let base = usize::from(id >> 2);
-        if base == 0 {
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            continue;
-        }
-        let rgb = BASE_COLORS.get(base).copied().unwrap_or(0x99_9999);
-        let mul = SHADE[usize::from(id & 3)];
-        let channel = |shift: u32| (((rgb >> shift) & 0xFF) * mul / 255) as u8;
-        out.extend_from_slice(&[channel(16), channel(8), channel(0), 255]);
+        out.extend_from_slice(&palette[usize::from(id)]);
     }
-    out
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -295,24 +291,25 @@ struct Contents {
     color: u32,
 }
 
-/// Dye colours as vanilla tints shulker boxes and bundles (`DyeColor.getTextureDiffuseColor`).
+/// This mod's own tint for each dye colour, `0xRRGGBB` (picked by eye for the panels, not
+/// copied from the game).
 const DYES: [(&str, u32); 16] = [
-    ("white", 0xF9FFFE),
-    ("orange", 0xF9801D),
-    ("magenta", 0xC74EBD),
-    ("light_blue", 0x3AB3DA),
-    ("yellow", 0xFED83D),
-    ("lime", 0x80C71F),
-    ("pink", 0xF38BAA),
-    ("gray", 0x474F52),
-    ("light_gray", 0x9D9D97),
-    ("cyan", 0x169C9C),
-    ("purple", 0x8932B8),
-    ("blue", 0x3C44AA),
-    ("brown", 0x835432),
-    ("green", 0x5E7C16),
-    ("red", 0xB02E26),
-    ("black", 0x1D1D21),
+    ("white", 0xF0F0EC),
+    ("orange", 0xE8822A),
+    ("magenta", 0xC458B8),
+    ("light_blue", 0x48ACD6),
+    ("yellow", 0xF2CF3E),
+    ("lime", 0x84C22A),
+    ("pink", 0xEB8FAE),
+    ("gray", 0x4C5256),
+    ("light_gray", 0x9C9C96),
+    ("cyan", 0x22968F),
+    ("purple", 0x8A3CB4),
+    ("blue", 0x4048A8),
+    ("brown", 0x80553A),
+    ("green", 0x5F7C20),
+    ("red", 0xAD3530),
+    ("black", 0x252528),
 ];
 /// An undyed shulker box's purple, and an undyed bundle's leather.
 const PLAIN_SHULKER: u32 = 0x97_6997;
@@ -775,8 +772,9 @@ impl Hooks for UniversalViewer {
                 } else {
                     0
                 };
-                if let Some((version, colors)) = vanilla_colors(id, after) {
-                    cache.store(id, &colors);
+                if let Some((version, colors)) = vanilla_colors(id, after)
+                    && cache.store(id, &colors)
+                {
                     cache.vanilla.insert(id, version);
                 }
                 if cache.vanilla.contains_key(&id) && cache.maps.contains_key(&id) {
@@ -1052,6 +1050,7 @@ fn on_map_data(data: MapData, _: &mut dyn IPayloadContext) -> Result<(), String>
         let Some((colors, _)) = cache.partial.remove(&id) else {
             return;
         };
+        // Without the palette yet the picture is dropped; it is asked for again later.
         cache.store(id, &colors);
     });
     Ok(())
