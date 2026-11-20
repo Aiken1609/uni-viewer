@@ -1,0 +1,6 @@
+{
+  "universal_viewer.setting.lock_mode": "Ctrl lock",
+  "universal_viewer.setting.lock_mode.hold": "Hold Ctrl",
+  "universal_viewer.setting.lock_mode.toggle": "Press Ctrl to toggle",
+  "universal_viewer.setting.lock_mode.tooltip": "How Ctrl locks a shulker box or bundle preview in place: while Ctrl is held, or from one press of Ctrl to the next."
+}

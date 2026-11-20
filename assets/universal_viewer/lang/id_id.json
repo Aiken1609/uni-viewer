@@ -1,0 +1,6 @@
+{
+  "universal_viewer.setting.lock_mode": "Kunci Ctrl",
+  "universal_viewer.setting.lock_mode.hold": "Tahan Ctrl",
+  "universal_viewer.setting.lock_mode.toggle": "Tekan Ctrl untuk ganti",
+  "universal_viewer.setting.lock_mode.tooltip": "Cara Ctrl mengunci tampilan isi shulker box atau bundle: selama Ctrl ditahan, atau dari satu tekanan Ctrl ke tekanan berikutnya."
+}

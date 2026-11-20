@@ -17,9 +17,10 @@
   dengan **ID**, **skala** (1:1 sampai 1:16), dan status **Locked/Unlocked**.
 - **Isi shulker box dan bundle**: tahan **Shift** sambil hover untuk melihat seluruh isinya dalam grid bergaya
   inventory vanilla, berwarna sesuai warna shulker atau bundle-nya (16 warna dye plus versi polos).
-- **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tekan **Ctrl** untuk mengunci panelnya di
+- **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tahan **Ctrl** untuk mengunci panelnya di
   tempat. Mouse bisa digerakkan ke atas panel untuk membaca setiap item: nama, enchantment, lore, dan gambar map.
-  Tekan Ctrl lagi untuk membuka kunci.
+  Lepas Ctrl untuk membuka kunci. Di Options > Mods > Universal Viewer, kunci bisa diganti menjadi mode tekan
+  (tekan Ctrl sekali untuk mengunci, sekali lagi untuk membuka).
 - **Shulker box yang ditaruh**: saat dibuka, layarnya ikut berwarna sesuai warna shulker-nya.
 
 ## Persyaratan
@@ -56,18 +57,20 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 | Lihat gambar map | Langsung tampil di ikon slot |
 | Lihat map lebih besar beserta ID, skala, dan status lock | Hover map |
 | Lihat isi shulker box atau bundle | Tahan `Shift` sambil hover |
-| Kunci panel isi supaya mouse bisa bergerak di atasnya | Tekan `Ctrl` saat panel isi tampil |
+| Kunci panel isi supaya mouse bisa bergerak di atasnya | Tahan `Ctrl` saat panel isi tampil |
 | Lihat detail item di dalam panel yang terkunci | Arahkan mouse ke slotnya (tahan `Shift` untuk isi shulker/bundle di dalamnya) |
-| Buka kunci panel | Tekan `Ctrl` lagi, atau tutup layarnya |
+| Buka kunci panel | Lepas `Ctrl` (mode tekan: tekan `Ctrl` lagi), atau tutup layarnya |
 | Shulker box berwarna saat dibuka | Klik kanan shulker box yang ditaruh |
 
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
-yang terkunci tidak mengambil item di slot di bawahnya. Tidak ada pengaturan tambahan.
+yang terkunci tidak mengambil item di slot di bawahnya. Satu-satunya pengaturan, **Ctrl lock** (tahan atau tekan),
+ada di Options > Mods > Universal Viewer.
 
 ## Batasan
 
 - Gambar map berasal dari data yang dikirim server ke client, yaitu untuk map yang pernah ada di inventory, di tangan,
-  atau di item frame dekat kamu. Map yang belum pernah dikirim tetap memakai ikon dan tooltip vanilla sampai datanya
+  atau di item frame dekat kamu. Ini juga berlaku untuk map di dalam shulker: map yang belum pernah kamu pegang
+  belum punya gambar di client, dan tooltip-nya menulis "Picture not loaded". Map yang belum pernah dikirim tetap memakai ikon dan tooltip vanilla sampai datanya
   diterima. Di singleplayer, dan di server yang juga memasang mod ini, map di chest langsung tampil.
 - Maksimal 64 gambar map disimpan sekaligus. Map yang paling lama tidak terlihat diganti saat ada map baru.
 - Posisi map di slot dibaca beberapa kali per detik, bukan setiap frame, supaya ringan walau ada banyak shulker
@@ -86,6 +89,7 @@ horizon-mod.toml           manifest, pin build Horizon, dan baris mixin
 Cargo.toml                 depends on horizon-mod-api
 src/lib.rs                 hook ke game, cache map, dan semua tampilan
 src/mixins/vanilla_map.rs  mixin yang menyalin paket map vanilla di client
+assets/universal_viewer/lang/  teks pengaturan (en_us, id_id)
 icon.png                   ikon mod (PNG persegi, maks 512 x 512)
 ```
 

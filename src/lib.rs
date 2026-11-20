@@ -54,7 +54,7 @@ const CELLS_PER_ROW: usize = ATLAS / MAP_SIZE;
 const CELLS: usize = CELLS_PER_ROW * CELLS_PER_ROW;
 
 /// Ticks between two reads of the open menu's slots for maps (a click reads them sooner).
-const SCAN_EVERY: u64 = 10;
+const SCAN_EVERY: u64 = 20;
 
 const TEXT_WHITE: u32 = 0xFFFF_FFFF;
 
@@ -535,8 +535,13 @@ fn vanilla_slot(draw: &mut dyn DrawContext, x: f32, y: f32, tint: u32) {
 }
 
 /// The footer's hint about the Ctrl lock.
-fn lock_hint(locked: bool) -> &'static str {
-    if locked { "Ctrl: unlock" } else { "Ctrl: lock" }
+fn lock_hint(locked: bool, toggles: bool) -> &'static str {
+    match (toggles, locked) {
+        (true, false) => "Ctrl: lock",
+        (true, true) => "Ctrl: unlock",
+        (false, false) => "Hold Ctrl: lock",
+        (false, true) => "Locked",
+    }
 }
 
 /// Where a contents panel's parts are, in GUI pixels.
@@ -571,7 +576,7 @@ fn panel_size(draw: &dyn DrawContext, title: &str, contents: &Contents) -> [f32;
     let footer = format!("{} items", contents.items);
     let grid_w = contents.columns as f32 * SLOT;
     let grid_h = contents.rows as f32 * SLOT;
-    let footer_w = draw.text_width(&footer) + 8.0 + draw.text_width(lock_hint(false));
+    let footer_w = draw.text_width(&footer) + 8.0 + draw.text_width(lock_hint(false, false));
     let w = grid_w.max(draw.text_width(title)).max(footer_w);
     let h = 11.0 + grid_h + 11.0;
     [w + PAD * 2.0, h + PAD * 2.0]
@@ -849,6 +854,8 @@ struct Scan {
 static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
 /// The tick to read the menu again at (0: on the regular beat), set by clicks and keys.
 static RESCAN_AT: AtomicU64 = AtomicU64::new(0);
+/// When a drawn menu last disagreed with the one read.
+static LAST_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
 fn local_menu(host: &dyn ClientHost) -> Option<mod_api::MenuRef> {
     let player = host.local_player()?;
@@ -918,6 +925,15 @@ fn locked_rect() -> Option<PanelLayout> {
 
 fn unlock() {
     *LOCK.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// The lock setting's key; its options, in order: hold Ctrl (the default), or press it to lock
+/// and again to unlock.
+const LOCK_MODE: &str = "lock_mode";
+
+/// Whether Ctrl toggles the lock (else the lock lasts while Ctrl is held).
+fn lock_toggles(host: &dyn ClientHost) -> bool {
+    host.setting_choice(LOCK_MODE) == Some(1)
 }
 
 fn is_control(key: &str) -> bool {
@@ -1052,6 +1068,12 @@ fn item_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<Text> {
     }
     if let Some(id) = root.get("minecraft:map_id").and_then(int) {
         lines.push(styled(Text::literal(format!("Map #{id}")), "gray", false));
+        // A server sends a map's picture only for a map the player carries or sees framed.
+        lines.push(styled(
+            Text::literal("Picture not loaded: carry this map once"),
+            "dark_gray",
+            true,
+        ));
     }
     if let Some(Tag::List(lore)) = root.get("minecraft:lore") {
         for line in lore {
@@ -1194,6 +1216,20 @@ impl Hooks for UniversalViewer {
             on_map_request,
         );
         *REQUEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
+
+        // Options > Mods > Universal Viewer: how Ctrl locks a contents panel.
+        let _ = r.register_setting(
+            mod_api::SettingSpec::choice(
+                LOCK_MODE,
+                "universal_viewer.setting.lock_mode",
+                [
+                    "universal_viewer.setting.lock_mode.hold",
+                    "universal_viewer.setting.lock_mode.toggle",
+                ],
+                0,
+            )
+            .tooltip("universal_viewer.setting.lock_mode.tooltip"),
+        );
 
         // The map picture inside a map's tooltip.
         let map = r.item_key("minecraft:filled_map");
@@ -1423,7 +1459,13 @@ impl Hooks for UniversalViewer {
             View::Contents(contents) => {
                 let [pw, ph] = panel_size(draw, &title, &contents);
                 let at = place(cursor, screen, pw, ph);
-                draw_contents_at(draw, at, &title, &contents, Some(lock_hint(false)));
+                draw_contents_at(
+                    draw,
+                    at,
+                    &title,
+                    &contents,
+                    Some(lock_hint(false, lock_toggles(host))),
+                );
                 let tick = with_cache(|cache| cache.tick);
                 *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = Some(Candidate {
                     tick,
@@ -1469,7 +1511,7 @@ impl Hooks for UniversalViewer {
     /// Ctrl over a contents panel locks it in place (or unlocks it).
     fn screen_key_pressed_pre(
         &self,
-        _: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
         let tick = with_cache(|cache| cache.tick);
@@ -1483,7 +1525,9 @@ impl Hooks for UniversalViewer {
         }
         let mut lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         if lock.is_some() {
-            *lock = None;
+            if lock_toggles(host) {
+                *lock = None;
+            }
             return Flow::Continue;
         }
         let candidate = CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -1538,13 +1582,18 @@ impl Hooks for UniversalViewer {
             *guard = None;
             return;
         }
+        // Hold mode: letting go of Ctrl lets go of the panel.
+        if !lock_toggles(host) && !host.modifiers().control() {
+            *guard = None;
+            return;
+        }
         let draw = &mut *event.draw;
         let layout = draw_contents_at(
             draw,
             locked.at,
             &locked.title,
             &locked.contents,
-            Some(lock_hint(true)),
+            Some(lock_hint(true, lock_toggles(host))),
         );
         locked.layout = Some(layout);
         let mouse = event.screen.mouse;
@@ -1567,7 +1616,7 @@ impl Hooks for UniversalViewer {
     fn screen_closing(&self, _: &dyn ClientHost, _: &mut ScreenClosingEvent<'_>) {
         unlock();
         *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        RESCAN_AT.store(1, Ordering::Relaxed);
+        rescan_soon(with_cache(|cache| cache.tick));
     }
 }
 
@@ -1583,8 +1632,13 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32
         return;
     };
     if boxes.len() != scan.menu_slots {
-        // Another menu than the one read: read this one.
-        RESCAN_AT.store(1, Ordering::Relaxed);
+        // Another menu than the one read: read this one, at most once a second (a screen whose
+        // boxes never match its slot count must not be read every tick).
+        let tick = with_cache(|cache| cache.tick);
+        if tick.saturating_sub(LAST_MISMATCH.load(Ordering::Relaxed)) >= 20 {
+            LAST_MISMATCH.store(tick, Ordering::Relaxed);
+            RESCAN_AT.store(tick + 1, Ordering::Relaxed);
+        }
         return;
     }
     for (slot, id, count) in scan.maps {
