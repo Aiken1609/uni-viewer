@@ -14,7 +14,8 @@
 - **Gambar map di slot**: map yang sudah termuat menampilkan gambarnya sendiri sebagai ikon, penuh tanpa bingkai,
   di inventory, chest, ender chest, dan hotbar.
 - **Tooltip map**: hover map untuk melihatnya lebih besar di tooltip vanilla, di dalam bingkai map asli game, lengkap
-  dengan **ID**, **skala** (1:1 sampai 1:16), dan status **Locked/Unlocked**.
+  dengan **ID**, **skala** (1:1 sampai 1:16), dan status **Locked/Unlocked**. Ukuran gambarnya bisa dipilih 64, 96,
+  atau 128 px (bawaan) di Options > Mods > Universal Viewer.
 - **Isi shulker box dan bundle**: tahan **Shift** sambil hover untuk melihat seluruh isinya dalam grid bergaya
   inventory vanilla, berwarna sesuai warna shulker atau bundle-nya (16 warna dye plus versi polos).
 - **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tahan **Ctrl** untuk mengunci panelnya di
@@ -64,8 +65,8 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 | Shulker box berwarna saat dibuka | Klik kanan shulker box yang ditaruh |
 
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
-yang terkunci tidak mengambil item di slot di bawahnya. Satu-satunya pengaturan, **Ctrl lock** (tahan atau tekan),
-ada di Options > Mods > Universal Viewer.
+yang terkunci tidak mengambil item di slot di bawahnya. Pengaturannya ada di Options > Mods > Universal Viewer:
+**Ctrl lock** (tahan atau tekan) dan **Tooltip map size** (64, 96, atau 128 px).
 
 ## Batasan
 

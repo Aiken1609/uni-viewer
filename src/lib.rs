@@ -665,6 +665,19 @@ const FRAME_RIM: u32 = 0xFF8E_7D5B;
 
 /// Vanilla's frame around a held map: 7 px of `map_background` around the 128 px picture.
 const HELD_FRAME: f32 = 7.0;
+
+/// The tooltip map size setting's key; its options, in order: 64, 96 and 128 px (the default).
+const TOOLTIP_MAP_SIZE: &str = "tooltip_map_size";
+const TOOLTIP_MAP_SIZES: [f32; 3] = [64.0, 96.0, 128.0];
+
+/// The tooltip map's picture side and its frame width, the frame scaled with the picture.
+fn tooltip_map_dims(host: &dyn ClientHost) -> (f32, f32) {
+    let image = host
+        .setting_choice(TOOLTIP_MAP_SIZE)
+        .and_then(|i| TOOLTIP_MAP_SIZES.get(i as usize).copied())
+        .unwrap_or(MAP_SIZE as f32 * MAP_SCALE);
+    (image, HELD_FRAME * image / MAP_SIZE as f32)
+}
 const MAP_BACKGROUND: &str = "map/map_background";
 
 /// Gray tooltip lines this mod adds.
@@ -685,7 +698,8 @@ fn add_map_to_tooltip(
     if !ready {
         return;
     }
-    let outer = MAP_SIZE as f32 * MAP_SCALE + HELD_FRAME * 2.0;
+    let (side, rim) = tooltip_map_dims(host);
+    let outer = side + rim * 2.0;
     let image = TooltipElement::Image(TooltipImage {
         source: TooltipImageSource::ItemPart(event.stack.clone()),
         size: [outer, outer + 4.0],
@@ -742,8 +756,8 @@ fn draw_framed_map(
     origin: [f32; 2],
     cell: usize,
 ) {
-    let image = MAP_SIZE as f32 * MAP_SCALE;
-    let outer = image + HELD_FRAME * 2.0;
+    let (image, rim) = tooltip_map_dims(host);
+    let outer = image + rim * 2.0;
     let [fx, fy] = origin;
     // The game's own `map_background` (so a resource pack's shows too), else a drawn one.
     let frame = Identifier::parse("minecraft:map/map_background")
@@ -761,7 +775,7 @@ fn draw_framed_map(
     if !drawn {
         draw_torn_frame(draw, fx, fy, outer);
     }
-    let (ix, iy) = (fx + HELD_FRAME, fy + HELD_FRAME);
+    let (ix, iy) = (fx + rim, fy + rim);
     draw.sprite(
         MOD_IMAGE_SPRITE,
         cell_rect(cell),
@@ -1206,7 +1220,8 @@ fn show_inner(
             cache.ready(id)
         });
         if let Some(cell) = cell {
-            let outer = MAP_SIZE as f32 * MAP_SCALE + HELD_FRAME * 2.0;
+            let (side, rim) = tooltip_map_dims(host);
+            let outer = side + rim * 2.0;
             let mut lines = vec![format!("Map #{id}")];
             if let Some((scale, locked)) = map_info(id) {
                 lines.push(format!("Scale 1:{}", 1u32 << scale));
@@ -1336,6 +1351,20 @@ impl Hooks for UniversalViewer {
                 0,
             )
             .tooltip("universal_viewer.setting.lock_mode.tooltip"),
+        );
+        // How large a map's picture shows in its tooltip.
+        let _ = r.register_setting(
+            mod_api::SettingSpec::choice(
+                TOOLTIP_MAP_SIZE,
+                "universal_viewer.setting.tooltip_map_size",
+                [
+                    "universal_viewer.setting.tooltip_map_size.64",
+                    "universal_viewer.setting.tooltip_map_size.96",
+                    "universal_viewer.setting.tooltip_map_size.128",
+                ],
+                2,
+            )
+            .tooltip("universal_viewer.setting.tooltip_map_size.tooltip"),
         );
 
         // The map picture inside a map's tooltip.
