@@ -18,8 +18,8 @@ use mod_api::{
     PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
     RenderTooltipPreEvent, RightClickBlockEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
-    ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, ScreenRenderPostEvent, Tag, Text,
-    ToClient, ToServer, TooltipComponentDrawEvent, TooltipElement, TooltipImage,
+    ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, ScreenRenderPostEvent, ScreenView,
+    Tag, Text, ToClient, ToServer, TooltipComponentDrawEvent, TooltipElement, TooltipImage,
     TooltipImageSource, VarInt,
 };
 use std::collections::{HashMap, HashSet};
@@ -52,9 +52,6 @@ const UPLOAD_EVERY: u64 = 4;
 const ATLAS: usize = 1024;
 const CELLS_PER_ROW: usize = ATLAS / MAP_SIZE;
 const CELLS: usize = CELLS_PER_ROW * CELLS_PER_ROW;
-
-/// Ticks between two reads of the open menu's slots for maps (a click reads them sooner).
-const SCAN_EVERY: u64 = 20;
 
 const TEXT_WHITE: u32 = 0xFFFF_FFFF;
 
@@ -851,30 +848,96 @@ struct Scan {
     maps: Vec<(usize, i32, u32)>,
 }
 
-static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
-/// The tick to read the menu again at (0: on the regular beat), set by clicks and keys.
+/// The menu read a few slots a tick, round and round, so no tick reads the whole of a menu full
+/// of shulker boxes at once.
+struct ScanState {
+    menu_slots: usize,
+    cursor: usize,
+    found: std::collections::BTreeMap<usize, (i32, u32)>,
+    /// Whether the last tick saw a screen open.
+    screen_open: bool,
+}
+
+static SCAN: Mutex<Option<ScanState>> = Mutex::new(None);
+/// The tick to read the whole menu at (0: none pending), set by clicks and keys.
 static RESCAN_AT: AtomicU64 = AtomicU64::new(0);
-/// When a drawn menu last disagreed with the one read.
-static LAST_MISMATCH: AtomicU64 = AtomicU64::new(0);
+/// The tick a screen last drew its foreground.
+static SCREEN_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Slots read per tick on the regular round (20 ticks a second).
+const SLOTS_PER_TICK: usize = 4;
 
 fn local_menu(host: &dyn ClientHost) -> Option<mod_api::MenuRef> {
     let player = host.local_player()?;
     player.container_menu(host as &dyn mod_api::Host)
 }
 
-fn scan_menu(host: &dyn ClientHost) -> Option<Scan> {
-    let menu = local_menu(host)?;
+/// One tick of reading: a few slots, or all of them right after a click or a screen opening.
+/// With no screen open only the hotbar is read, the one place maps show then.
+fn scan_step(host: &dyn ClientHost, tick: u64) {
+    let Some(menu) = local_menu(host) else {
+        *SCAN.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        return;
+    };
     let read = host as &dyn mod_api::Host;
-    let menu_slots = menu.slot_count(read)?;
-    let mut maps = Vec::new();
-    for slot in 0..menu_slots {
-        if let Some(Some(stack)) = menu.slot(read, slot)
-            && let Some(id) = map_id_of(&stack)
-        {
-            maps.push((slot, id, stack.count()));
+    let Some(menu_slots) = menu.slot_count(read) else {
+        return;
+    };
+    let screen_open = tick.saturating_sub(SCREEN_SEEN.load(Ordering::Relaxed)) <= 2;
+    let rescan_at = RESCAN_AT.load(Ordering::Relaxed);
+    let mut whole = rescan_at != 0 && tick >= rescan_at;
+    if whole {
+        RESCAN_AT.store(0, Ordering::Relaxed);
+    }
+    let mut guard = SCAN.lock().unwrap_or_else(|p| p.into_inner());
+    let state = guard.get_or_insert_with(|| ScanState {
+        menu_slots: usize::MAX,
+        cursor: 0,
+        found: Default::default(),
+        screen_open,
+    });
+    if state.menu_slots != menu_slots {
+        state.menu_slots = menu_slots;
+        state.cursor = 0;
+        state.found.clear();
+        whole = true;
+    }
+    if screen_open && !state.screen_open {
+        whole = true;
+    }
+    state.screen_open = screen_open;
+    // The player's inventory menu holds the hotbar at 36..45; any other menu ends with it.
+    let hotbar_from = if menu_slots == 46 {
+        36
+    } else {
+        menu_slots.saturating_sub(9)
+    };
+    let range = if screen_open {
+        0..menu_slots
+    } else {
+        hotbar_from..(hotbar_from + 9).min(menu_slots)
+    };
+    let len = range.len();
+    if len == 0 {
+        return;
+    }
+    let budget = if whole { len } else { SLOTS_PER_TICK.min(len) };
+    for _ in 0..budget {
+        let slot = range.start + state.cursor % len;
+        state.cursor = (state.cursor + 1) % len;
+        match menu.slot(read, slot) {
+            Some(Some(stack)) => match map_id_of(&stack) {
+                Some(id) => {
+                    state.found.insert(slot, (id, stack.count()));
+                }
+                None => {
+                    state.found.remove(&slot);
+                }
+            },
+            _ => {
+                state.found.remove(&slot);
+            }
         }
     }
-    Some(Scan { menu_slots, maps })
 }
 
 /// Reads the menu again soon: now, and once more after the server's slot update.
@@ -883,7 +946,16 @@ fn rescan_soon(tick: u64) {
 }
 
 fn current_scan() -> Option<Scan> {
-    SCAN.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    let guard = SCAN.lock().unwrap_or_else(|p| p.into_inner());
+    let state = guard.as_ref()?;
+    Some(Scan {
+        menu_slots: state.menu_slots,
+        maps: state
+            .found
+            .iter()
+            .map(|(slot, (id, count))| (*slot, *id, *count))
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1171,17 +1243,49 @@ const SCREEN_H: f32 = 166.0;
 /// Top-left of each 9-wide slot row block (the slot frame, one pixel outside the item), rows.
 const SCREEN_GRIDS: [(f32, f32, usize); 3] = [(7.0, 17.0, 3), (7.0, 83.0, 3), (7.0, 141.0, 1)];
 
-/// The tint of the open screen, when it is a placed shulker box's of 176 x 166.
-fn shulker_screen(screen: &mod_api::ScreenView<'_>) -> Option<([f32; 2], u32)> {
-    if screen.menu != Some("minecraft:shulker_box") {
+/// The colour of a shulker box block or item named `id` (`minecraft:red_shulker_box`), or None
+/// for anything else.
+fn shulker_color_by_name(id: &str) -> Option<u32> {
+    let path = id.split('[').next()?.rsplit(':').next()?;
+    if path == "shulker_box" {
+        return Some(PLAIN_SHULKER);
+    }
+    let dye = path.strip_suffix("_shulker_box")?;
+    DYES.iter()
+        .find(|(name, _)| *name == dye)
+        .map(|(_, rgb)| *rgb)
+}
+
+/// The colour of the shulker box under the crosshair, the block whose screen is open.
+fn aimed_shulker(host: &dyn ClientHost) -> Option<u32> {
+    match host.crosshair_target()? {
+        mod_api::CrosshairTarget::Block { state, .. } => {
+            shulker_color_by_name(&host.block_state_string(state)?)
+        }
+        _ => None,
+    }
+}
+
+/// The open placed shulker box's panel (its top left) and tint: the screen of a shulker box menu,
+/// or of a 3-row chest-sized menu while the crosshair is on a shulker box.
+fn shulker_screen(host: &dyn ClientHost, screen: &ScreenView<'_>) -> Option<([f32; 2], u32)> {
+    let color =
+        aimed_shulker(host).or_else(|| *OPENED.lock().unwrap_or_else(|p| p.into_inner()))?;
+    let shulker_menu = screen.menu == Some("minecraft:shulker_box");
+    if !shulker_menu && screen.slots != 63 {
         return None;
     }
     let [x, y, w, h] = screen.rect;
-    if (w - SCREEN_W).abs() > 0.5 || (h - SCREEN_H).abs() > 0.5 {
-        return None;
-    }
-    let color = (*OPENED.lock().unwrap_or_else(|p| p.into_inner()))?;
-    Some(([x, y], soften(color)))
+    let at = if (w - SCREEN_W).abs() <= 0.5 && (h - SCREEN_H).abs() <= 0.5 {
+        [x, y]
+    } else {
+        // The rectangle is the whole window: the panel sits in its middle, as vanilla centres it.
+        [
+            x + ((w - SCREEN_W) / 2.0).floor(),
+            y + ((h - SCREEN_H) / 2.0).floor(),
+        ]
+    };
+    Some((at, soften(color)))
 }
 
 /// Whether labels on a face of this tint want white text.
@@ -1243,15 +1347,8 @@ impl Hooks for UniversalViewer {
             cache.tick += 1;
             cache.tick
         });
-        // The open menu's maps, a few times a second and soon after a click.
-        let rescan_at = RESCAN_AT.load(Ordering::Relaxed);
-        if tick % SCAN_EVERY == 0 || (rescan_at != 0 && tick >= rescan_at) {
-            if tick >= rescan_at {
-                RESCAN_AT.store(0, Ordering::Relaxed);
-            }
-            let scan = scan_menu(&*host);
-            *SCAN.lock().unwrap_or_else(|p| p.into_inner()) = scan;
-        }
+        // The open menu's maps: a few slots each tick, all of them after a click.
+        scan_step(&*host, tick);
         let asks = with_cache(|cache| {
             let hovered = cache.hovered.take();
             let on_slots = std::mem::take(&mut cache.on_slots);
@@ -1345,10 +1442,10 @@ impl Hooks for UniversalViewer {
     /// items and labels.
     fn screen_render_background(
         &self,
-        _: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenRenderBackgroundEvent<'_>,
     ) {
-        let Some(([x, y], tint)) = shulker_screen(event.screen) else {
+        let Some(([x, y], tint)) = shulker_screen(host, event.screen) else {
             return;
         };
         let draw = &mut *event.draw;
@@ -1364,12 +1461,24 @@ impl Hooks for UniversalViewer {
         draw.fill([x + 1.0, y + 1.0, 2.0, h - 4.0], light);
         draw.fill([x + 3.0, y + h - 3.0, w - 4.0, 2.0], dark);
         draw.fill([x + w - 3.0, y + 3.0, 2.0, h - 4.0], dark);
-        for (gx, gy, rows) in SCREEN_GRIDS {
-            for row in 0..rows {
-                for column in 0..COLUMNS {
-                    let sx = x + gx + column as f32 * SLOT;
-                    let sy = y + gy + row as f32 * SLOT;
-                    vanilla_slot(draw, sx, sy, tint);
+        // The slots where the screen really has them (its slot boxes are the 16 x 16 item
+        // squares, the frame one pixel around), else vanilla's layout.
+        let boxes = local_menu(host).and_then(|menu| menu.slot_boxes(host));
+        match boxes {
+            Some(boxes) if !boxes.is_empty() => {
+                for [sx, sy, _, _] in boxes.into_iter().flatten() {
+                    vanilla_slot(draw, sx - 1.0, sy - 1.0, tint);
+                }
+            }
+            _ => {
+                for (gx, gy, rows) in SCREEN_GRIDS {
+                    for row in 0..rows {
+                        for column in 0..COLUMNS {
+                            let sx = x + gx + column as f32 * SLOT;
+                            let sy = y + gy + row as f32 * SLOT;
+                            vanilla_slot(draw, sx, sy, tint);
+                        }
+                    }
                 }
             }
         }
@@ -1381,8 +1490,9 @@ impl Hooks for UniversalViewer {
         host: &dyn ClientHost,
         event: &mut ScreenRenderForegroundEvent<'_>,
     ) {
+        SCREEN_SEEN.store(with_cache(|cache| cache.tick), Ordering::Relaxed);
         draw_menu_maps(host, &mut *event.draw, event.screen.mouse);
-        let Some(([x, y], tint)) = shulker_screen(event.screen) else {
+        let Some(([x, y], tint)) = shulker_screen(host, event.screen) else {
             return;
         };
         if !dark_face(tint) {
@@ -1632,13 +1742,7 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32
         return;
     };
     if boxes.len() != scan.menu_slots {
-        // Another menu than the one read: read this one, at most once a second (a screen whose
-        // boxes never match its slot count must not be read every tick).
-        let tick = with_cache(|cache| cache.tick);
-        if tick.saturating_sub(LAST_MISMATCH.load(Ordering::Relaxed)) >= 20 {
-            LAST_MISMATCH.store(tick, Ordering::Relaxed);
-            RESCAN_AT.store(tick + 1, Ordering::Relaxed);
-        }
+        // Another menu than the one read; the next tick reads this one.
         return;
     }
     for (slot, id, count) in scan.maps {

@@ -21,7 +21,8 @@
   tempat. Mouse bisa digerakkan ke atas panel untuk membaca setiap item: nama, enchantment, lore, dan gambar map.
   Lepas Ctrl untuk membuka kunci. Di Options > Mods > Universal Viewer, kunci bisa diganti menjadi mode tekan
   (tekan Ctrl sekali untuk mengunci, sekali lagi untuk membuka).
-- **Shulker box yang ditaruh**: saat dibuka, layarnya ikut berwarna sesuai warna shulker-nya.
+- **Shulker box yang ditaruh**: saat dibuka, panel inventory-nya (latar dan semua slot) ikut berwarna sesuai warna
+  shulker-nya.
 
 ## Persyaratan
 
@@ -79,8 +80,8 @@ ada di Options > Mods > Universal Viewer.
 - Tooltip item di dalam panel terkunci dibuat oleh mod (nama, enchantment, lore, ID map), jadi baris tambahan dari
   mod lain atau server untuk item itu tidak ikut tampil.
 - Warna layar shulker yang ditaruh mengikuti tata letak layar vanilla (176 x 166). Resource pack yang memindahkan
-  slotnya akan membuat warnanya tidak pas. Warna ditentukan dari blok yang kamu klik kanan, jadi shulker yang dibuka
-  lewat command atau plugin tetap tampil vanilla.
+  slotnya bisa membuat latarnya tidak pas (slotnya tetap mengikuti posisi aslinya). Warna diambil dari shulker yang
+  sedang kamu tatap, jadi shulker yang dibuka lewat command atau plugin tetap tampil vanilla.
 
 ## Untuk pengembang
 
