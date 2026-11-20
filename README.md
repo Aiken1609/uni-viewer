@@ -12,11 +12,14 @@
 ## Fitur
 
 - **Gambar map di slot**: map yang sudah termuat menampilkan gambarnya sendiri sebagai ikon, penuh tanpa bingkai,
-  di inventory, chest, hotbar, dan tab creative.
+  di inventory, chest, ender chest, dan hotbar.
 - **Tooltip map**: hover map untuk melihatnya lebih besar di tooltip vanilla, di dalam bingkai map asli game, lengkap
   dengan **ID**, **skala** (1:1 sampai 1:16), dan status **Locked/Unlocked**.
 - **Isi shulker box dan bundle**: tahan **Shift** sambil hover untuk melihat seluruh isinya dalam grid bergaya
   inventory vanilla, berwarna sesuai warna shulker atau bundle-nya (16 warna dye plus versi polos).
+- **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tekan **Ctrl** untuk mengunci panelnya di
+  tempat. Mouse bisa digerakkan ke atas panel untuk membaca setiap item: nama, enchantment, lore, dan gambar map.
+  Tekan Ctrl lagi untuk membuka kunci.
 - **Shulker box yang ditaruh**: saat dibuka, layarnya ikut berwarna sesuai warna shulker-nya.
 
 ## Persyaratan
@@ -28,6 +31,11 @@
   Baca source-nya dulu kalau perlu.
 
 ## Pasang
+
+Universal Viewer sudah terdaftar di registry Horizon: cari **Universal Viewer** di daftar mod launcher atau di
+[playhorizon.dev/mods](https://playhorizon.dev/mods), pasang, lalu klik **Build**.
+
+Atau langsung dari GitHub:
 
 1. Di launcher, buka **Mods**, lalu bagian *Add a native mod from GitHub*.
 2. Tempel `https://github.com/Aiken1609/uni-viewer` dan klik **Add from GitHub**.
@@ -48,10 +56,13 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 | Lihat gambar map | Langsung tampil di ikon slot |
 | Lihat map lebih besar beserta ID, skala, dan status lock | Hover map |
 | Lihat isi shulker box atau bundle | Tahan `Shift` sambil hover |
+| Kunci panel isi supaya mouse bisa bergerak di atasnya | Tekan `Ctrl` saat panel isi tampil |
+| Lihat detail item di dalam panel yang terkunci | Arahkan mouse ke slotnya (tahan `Shift` untuk isi shulker/bundle di dalamnya) |
+| Buka kunci panel | Tekan `Ctrl` lagi, atau tutup layarnya |
 | Shulker box berwarna saat dibuka | Klik kanan shulker box yang ditaruh |
 
-Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Tidak ada keybind
-atau pengaturan tambahan.
+Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
+yang terkunci tidak mengambil item di slot di bawahnya. Tidak ada pengaturan tambahan.
 
 ## Batasan
 
@@ -59,6 +70,11 @@ atau pengaturan tambahan.
   atau di item frame dekat kamu. Map yang belum pernah dikirim tetap memakai ikon dan tooltip vanilla sampai datanya
   diterima. Di singleplayer, dan di server yang juga memasang mod ini, map di chest langsung tampil.
 - Maksimal 64 gambar map disimpan sekaligus. Map yang paling lama tidak terlihat diganti saat ada map baru.
+- Posisi map di slot dibaca beberapa kali per detik, bukan setiap frame, supaya ringan walau ada banyak shulker
+  penuh di layar. Setelah map dipindah, gambarnya bisa terlambat sepersekian detik mengikuti slot barunya. Tab item
+  di creative tetap memakai ikon vanilla.
+- Tooltip item di dalam panel terkunci dibuat oleh mod (nama, enchantment, lore, ID map), jadi baris tambahan dari
+  mod lain atau server untuk item itu tidak ikut tampil.
 - Warna layar shulker yang ditaruh mengikuti tata letak layar vanilla (176 x 166). Resource pack yang memindahkan
   slotnya akan membuat warnanya tidak pas. Warna ditentukan dari blok yang kamu klik kanan, jadi shulker yang dibuka
   lewat command atau plugin tetap tampil vanilla.

@@ -4,23 +4,27 @@
 //!   hovered (inventory, chests, creative tabs...). No key needed.
 //! * **Shulker boxes** (and any other stack that carries `minecraft:container`) and **bundles**
 //!   (`minecraft:bundle_contents`) show their whole contents as a slot grid while Shift is held.
+//!   Ctrl locks that grid in place, so the mouse can move over it to read each item.
 //!
 //! Containers and bundles are read straight from the stack's own components, so the client
 //! needs nothing from the server. A map's pixels live only on the server (the client mod API has
 //! no read of them), so the mod asks the server for them over a small optional payload and caches
 //! the answer. On a server without this mod the map panel says so instead of drawing.
 
+use mod_api::text::{TextContent, TextStyle};
 use mod_api::{
-    ClientHost, ClientTickPreEvent, DrawContext, HostSide, LevelDimension, RightClickBlockEvent,
-    ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, Flow, Hooks, IPayloadContext, ItemDecorationsEvent,
-    Identifier, ItemKey, ItemPart, ItemStack, TooltipComponentDrawEvent, TooltipImage,
-    TooltipImageSource,
-    PayloadCodec, PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
-    RenderTooltipPreEvent, Tag, Text, ToClient, ToServer, TooltipElement, VarInt,
+    ClientHost, ClientTickPreEvent, DrawContext, Flow, GuiLayerPostEvent, Hooks, HostSide,
+    IPayloadContext, Identifier, ItemKey, ItemPart, ItemStack, LevelDimension, PayloadCodec,
+    PayloadId, Registrar, RegistrationContext, RenderTooltipGatherComponentsEvent,
+    RenderTooltipPreEvent, RightClickBlockEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenRenderBackgroundEvent, ScreenRenderForegroundEvent, ScreenRenderPostEvent, Tag, Text,
+    ToClient, ToServer, TooltipComponentDrawEvent, TooltipElement, TooltipImage,
+    TooltipImageSource, VarInt,
 };
-use mod_api::text::TextContent;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------------------------
 // Tunables
@@ -48,6 +52,9 @@ const UPLOAD_EVERY: u64 = 4;
 const ATLAS: usize = 1024;
 const CELLS_PER_ROW: usize = ATLAS / MAP_SIZE;
 const CELLS: usize = CELLS_PER_ROW * CELLS_PER_ROW;
+
+/// Ticks between two reads of the open menu's slots for maps (a click reads them sooner).
+const SCAN_EVERY: u64 = 10;
 
 const TEXT_WHITE: u32 = 0xFFFF_FFFF;
 
@@ -87,7 +94,11 @@ pub fn vanilla_map_info(id: i32, scale: i8, locked: bool) {
 }
 
 fn map_info(id: i32) -> Option<(u8, bool)> {
-    INFO.lock().unwrap_or_else(|p| p.into_inner()).as_ref()?.get(&id).copied()
+    INFO.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()?
+        .get(&id)
+        .copied()
 }
 
 /// A payload list holds at most 4096 entries, so a 128x128 map goes in four slices.
@@ -245,7 +256,9 @@ fn vanilla_colors(id: i32, after: u64) -> Option<(u64, Vec<u8>)> {
 }
 
 fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
-    let mut guard = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(guard.get_or_insert_with(Cache::default))
 }
 
@@ -280,6 +293,7 @@ enum View {
     Contents(Contents),
 }
 
+#[derive(Clone)]
 struct Contents {
     columns: usize,
     rows: usize,
@@ -331,11 +345,12 @@ fn color_of(host: &dyn ClientHost, item: ItemKey, kind: &str, plain: u32, other:
             return rgb;
         }
     }
-    if is(&format!("minecraft:{kind}")) { plain } else { other }
+    if is(&format!("minecraft:{kind}")) {
+        plain
+    } else {
+        other
+    }
 }
-
-
-
 
 /// The stack's component patch as one NBT compound to look entries up in.
 fn components(stack: &ItemStack) -> Option<Tag> {
@@ -386,7 +401,13 @@ fn view_of(host: &dyn ClientHost, stack: &ItemStack, with_contents: bool) -> Opt
         }
         let highest = slots.iter().map(|(slot, _)| *slot).max().unwrap_or(0);
         let rows = (highest / COLUMNS + 1).max(3);
-        let color = color_of(host, stack.item(), "shulker_box", PLAIN_SHULKER, PLAIN_OTHER);
+        let color = color_of(
+            host,
+            stack.item(),
+            "shulker_box",
+            PLAIN_SHULKER,
+            PLAIN_OTHER,
+        );
         return Some(View::Contents(finish(COLUMNS, rows, slots, color)));
     }
     if let Some(Tag::List(entries)) = root.get("minecraft:bundle_contents") {
@@ -450,8 +471,6 @@ fn plain(host: &dyn ClientHost, text: &Text) -> String {
 // Drawing
 // ---------------------------------------------------------------------------------------------
 
-/// Draws a tooltip box `w` x `h` GUI pixels hung from the cursor as the game hangs one, kept on
-
 /// Gray `gray` (one channel, as vanilla's GUI textures use) multiplied by `tint` (`0xRRGGBB`), ARGB.
 fn mul(gray: u32, tint: u32) -> u32 {
     let channel = |shift: u32| (((tint >> shift) & 0xFF) * gray / 255) << shift;
@@ -470,19 +489,11 @@ fn soften(rgb: u32) -> u32 {
 /// Inner padding of the vanilla-style panel, as a container screen has.
 const PAD: f32 = 7.0;
 
-/// A container-screen panel (black outline, light top-left bevel, dark bottom-right bevel,
-/// `#C6C6C6` face), all multiplied by `tint`. `w` x `h` is the content; returns its corner.
-fn vanilla_panel(
-    draw: &mut dyn DrawContext,
-    cursor: [i32; 2],
-    screen: [i32; 2],
-    w: f32,
-    h: f32,
-    tint: u32,
-) -> [f32; 2] {
-    let (pw, ph) = (w + PAD * 2.0, h + PAD * 2.0);
-    let (cx, cy) = (cursor[0] as f32, cursor[1] as f32);
-    let (sw, sh) = (screen[0] as f32, screen[1] as f32);
+/// Where a panel of `pw` x `ph` GUI pixels goes beside the cursor, as a tooltip is placed: right
+/// of it and a little up, flipped left at the screen's right edge and kept on screen.
+fn place(cursor: [f32; 2], screen: [f32; 2], pw: f32, ph: f32) -> [f32; 2] {
+    let [cx, cy] = cursor;
+    let [sw, sh] = screen;
     let mut x = cx + 12.0;
     if x + pw + 2.0 > sw {
         x = cx - 12.0 - pw;
@@ -492,8 +503,13 @@ fn vanilla_panel(
     if y + ph + 2.0 > sh {
         y = sh - ph - 2.0;
     }
-    y = y.max(2.0);
+    [x, y.max(2.0)]
+}
 
+/// A container-screen panel `[x, y, w, h]` (black outline, light top-left bevel, dark
+/// bottom-right bevel, `#C6C6C6` face), all multiplied by `tint`.
+fn vanilla_panel(draw: &mut dyn DrawContext, rect: [f32; 4], tint: u32) {
+    let [x, y, pw, ph] = rect;
     let black = 0xFF00_0000;
     let (face, light, dark) = (mul(0xC6, tint), mul(0xFF, tint), mul(0x55, tint));
     // Outline with cut corners.
@@ -507,7 +523,6 @@ fn vanilla_panel(
     draw.fill([x + 1.0, y + 1.0, 2.0, ph - 4.0], light);
     draw.fill([x + 3.0, y + ph - 3.0, pw - 4.0, 2.0], dark);
     draw.fill([x + pw - 3.0, y + 3.0, 2.0, ph - 4.0], dark);
-    [x + PAD, y + PAD]
 }
 
 /// One sunken inventory slot at `(x, y)`, 18 x 18, tinted.
@@ -519,33 +534,84 @@ fn vanilla_slot(draw: &mut dyn DrawContext, x: f32, y: f32, tint: u32) {
     draw.fill([x + SLOT - 1.0, y + 1.0, 1.0, SLOT - 1.0], mul(0xFF, tint));
 }
 
-fn draw_contents(
-    draw: &mut dyn DrawContext,
-    cursor: [i32; 2],
-    screen: [i32; 2],
-    title: &str,
-    contents: &Contents,
-) {
+/// The footer's hint about the Ctrl lock.
+fn lock_hint(locked: bool) -> &'static str {
+    if locked { "Ctrl: unlock" } else { "Ctrl: lock" }
+}
+
+/// Where a contents panel's parts are, in GUI pixels.
+#[derive(Clone, Copy)]
+struct PanelLayout {
+    /// The whole panel, `[x, y, w, h]`.
+    rect: [f32; 4],
+    /// The top left of the slot grid (the first slot's frame).
+    grid: [f32; 2],
+}
+
+impl PanelLayout {
+    fn contains(&self, point: [f32; 2]) -> bool {
+        let [x, y, w, h] = self.rect;
+        point[0] >= x && point[0] < x + w && point[1] >= y && point[1] < y + h
+    }
+
+    /// The grid cell (row-major index) under `point`, if any.
+    fn cell_at(&self, point: [f32; 2], columns: usize, rows: usize) -> Option<usize> {
+        let dx = point[0] - self.grid[0];
+        let dy = point[1] - self.grid[1];
+        if dx < 0.0 || dy < 0.0 {
+            return None;
+        }
+        let (column, row) = ((dx / SLOT) as usize, (dy / SLOT) as usize);
+        (column < columns && row < rows).then_some(row * columns + column)
+    }
+}
+
+/// The size of a contents panel, padding included.
+fn panel_size(draw: &dyn DrawContext, title: &str, contents: &Contents) -> [f32; 2] {
     let footer = format!("{} items", contents.items);
     let grid_w = contents.columns as f32 * SLOT;
     let grid_h = contents.rows as f32 * SLOT;
-    let w = grid_w
-        .max(draw.text_width(title))
-        .max(draw.text_width(&footer));
+    let footer_w = draw.text_width(&footer) + 8.0 + draw.text_width(lock_hint(false));
+    let w = grid_w.max(draw.text_width(title)).max(footer_w);
     let h = 11.0 + grid_h + 11.0;
+    [w + PAD * 2.0, h + PAD * 2.0]
+}
+
+/// Draws a contents panel with its top left at `at`: the title, the slots (a map's picture on its
+/// slot when it is here), the item count and the lock hint.
+fn draw_contents_at(
+    draw: &mut dyn DrawContext,
+    at: [f32; 2],
+    title: &str,
+    contents: &Contents,
+    hint: Option<&str>,
+) -> PanelLayout {
+    let [pw, ph] = panel_size(draw, title, contents);
+    let rect = [at[0], at[1], pw, ph];
     let tint = soften(contents.color);
-    let [x, y] = vanilla_panel(draw, cursor, screen, w, h, tint);
+    vanilla_panel(draw, rect, tint);
+    let (x, y, w) = (at[0] + PAD, at[1] + PAD, pw - PAD * 2.0);
 
     // Vanilla's dark label colour on a light face, white with a shadow on a dark one.
-    let (label, shadow) = if dark_face(tint) { (TEXT_WHITE, true) } else { (0xFF40_4040, false) };
-
+    let (label, shadow) = if dark_face(tint) {
+        (TEXT_WHITE, true)
+    } else {
+        (0xFF40_4040, false)
+    };
     draw.text(title, [x, y], label, shadow);
 
+    let grid_w = contents.columns as f32 * SLOT;
+    let grid_h = contents.rows as f32 * SLOT;
     let gx = x + ((w - grid_w) / 2.0).floor();
     let gy = y + 11.0;
     for row in 0..contents.rows {
         for column in 0..contents.columns {
-            vanilla_slot(draw, gx + column as f32 * SLOT, gy + row as f32 * SLOT, tint);
+            vanilla_slot(
+                draw,
+                gx + column as f32 * SLOT,
+                gy + row as f32 * SLOT,
+                tint,
+            );
         }
     }
     for (slot, stack) in &contents.slots {
@@ -553,8 +619,21 @@ fn draw_contents(
         let sy = gy + (slot / contents.columns) as f32 * SLOT;
         let count = (stack.count() > 1).then(|| stack.count().to_string());
         draw.gui_draw_item_with(stack, [sx + 1.0, sy + 1.0], count.as_deref());
+        if let Some(id) = map_id_of(stack) {
+            draw_slot_map(draw, [sx + 1.0, sy + 1.0], id, stack.count());
+        }
     }
-    draw.text(&footer, [x, gy + grid_h + 3.0], label, shadow);
+    let footer = format!("{} items", contents.items);
+    let fy = gy + grid_h + 3.0;
+    draw.text(&footer, [x, fy], label, shadow);
+    if let Some(hint) = hint {
+        let hint_x = x + w - draw.text_width(hint);
+        draw.text(hint, [hint_x, fy], label, shadow);
+    }
+    PanelLayout {
+        rect,
+        grid: [gx, gy],
+    }
 }
 
 /// The paper a map is drawn on, under its unexplored (transparent) pixels.
@@ -589,7 +668,11 @@ const LORE_GRAY: u32 = 0xAAAA_AAFF;
 /// Puts map `id`'s picture into its tooltip, under the name, as an image component the game lays
 /// out with every other line (vanilla's, a server's lore and prices, other mods'), and adds its
 /// zoom and lock under vanilla's id line.
-fn add_map_to_tooltip(host: &dyn ClientHost, event: &mut RenderTooltipGatherComponentsEvent<'_>, id: i32) {
+fn add_map_to_tooltip(
+    host: &dyn ClientHost,
+    event: &mut RenderTooltipGatherComponentsEvent<'_>,
+    id: i32,
+) {
     let ready = with_cache(|cache| {
         cache.hovered = Some(id);
         cache.ready(id).is_some()
@@ -616,7 +699,9 @@ fn add_map_to_tooltip(host: &dyn ClientHost, event: &mut RenderTooltipGatherComp
             TooltipElement::Image(_) => String::new(),
         })
         .collect();
-    let locked_word = host.translate("filled_map.locked").unwrap_or_else(|| "Locked".to_string());
+    let locked_word = host
+        .translate("filled_map.locked")
+        .unwrap_or_else(|| "Locked".to_string());
     let id_text = format!("#{id}");
     // Under vanilla's "Id #n" (and its "Locked"), else right under the picture.
     let mut after = lines
@@ -624,7 +709,11 @@ fn add_map_to_tooltip(host: &dyn ClientHost, event: &mut RenderTooltipGatherComp
         .position(|line| line.contains(&id_text))
         .map_or(at + 1, |i| i + 1);
     let has_locked = lines.iter().any(|line| line.trim() == locked_word);
-    if has_locked && lines.get(after).is_some_and(|line| line.trim() == locked_word) {
+    if has_locked
+        && lines
+            .get(after)
+            .is_some_and(|line| line.trim() == locked_word)
+    {
         after += 1;
     }
     let mut extra = vec![format!("Scale 1:{}", 1u32 << scale)];
@@ -635,12 +724,19 @@ fn add_map_to_tooltip(host: &dyn ClientHost, event: &mut RenderTooltipGatherComp
     }
     for (i, line) in extra.into_iter().enumerate() {
         let at = (after + i).min(event.elements.len());
-        event.elements.insert(at, TooltipElement::Text(Text::literal(line), LORE_GRAY));
+        event
+            .elements
+            .insert(at, TooltipElement::Text(Text::literal(line), LORE_GRAY));
     }
 }
 
 /// Draws the held-map frame and the picture of the map in `stack` with its top left at `origin`.
-fn draw_framed_map(host: &dyn ClientHost, draw: &mut dyn DrawContext, origin: [f32; 2], cell: usize) {
+fn draw_framed_map(
+    host: &dyn ClientHost,
+    draw: &mut dyn DrawContext,
+    origin: [f32; 2],
+    cell: usize,
+) {
     let image = MAP_SIZE as f32 * MAP_SCALE;
     let outer = image + HELD_FRAME * 2.0;
     let [fx, fy] = origin;
@@ -650,13 +746,23 @@ fn draw_framed_map(host: &dyn ClientHost, draw: &mut dyn DrawContext, origin: [f
         .and_then(|sprite| host.gui_sprite(&sprite));
     let drawn = frame.is_some_and(|region| {
         let [sw, sh] = region.size;
-        draw.sprite(MAP_BACKGROUND, [0.0, 0.0, sw as f32, sh as f32], [fx, fy, outer, outer], None)
+        draw.sprite(
+            MAP_BACKGROUND,
+            [0.0, 0.0, sw as f32, sh as f32],
+            [fx, fy, outer, outer],
+            None,
+        )
     });
     if !drawn {
         draw_torn_frame(draw, fx, fy, outer);
     }
     let (ix, iy) = (fx + HELD_FRAME, fy + HELD_FRAME);
-    draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [ix, iy, image, image], None);
+    draw.sprite(
+        MOD_IMAGE_SPRITE,
+        cell_rect(cell),
+        [ix, iy, image, image],
+        None,
+    );
 }
 
 /// A sheet of paper with torn edges, `size` square, for when the game has no `map_background`.
@@ -665,7 +771,12 @@ fn draw_torn_frame(draw: &mut dyn DrawContext, fx: f32, fy: f32, size: f32) {
     let last = blocks - 1;
     for by in 0..blocks {
         for bx in 0..blocks {
-            let sides = [(0, bx, by), (1, bx, last - by), (2, by, bx), (3, by, last - bx)];
+            let sides = [
+                (0, bx, by),
+                (1, bx, last - by),
+                (2, by, bx),
+                (3, by, last - bx),
+            ];
             let mut color = FRAME_PAPER;
             for (side, along, depth) in sides {
                 let torn = tear(side, along);
@@ -678,10 +789,350 @@ fn draw_torn_frame(draw: &mut dyn DrawContext, fx: f32, fy: f32, size: f32) {
                 }
             }
             if color != 0 {
-                draw.fill([fx + bx as f32 * 2.0, fy + by as f32 * 2.0, 2.0, 2.0], color);
+                draw.fill(
+                    [fx + bx as f32 * 2.0, fy + by as f32 * 2.0, 2.0, 2.0],
+                    color,
+                );
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Map pictures on slots, drawn once a frame per screen (not per item)
+// ---------------------------------------------------------------------------------------------
+//
+// An `item_decorations` part would be called for every item icon drawn, and the game converts
+// each of those stacks (a full shulker box's 27 items included) to hand it over, every frame.
+// So the open menu's slots are read a few times a second instead, and the maps among them drawn
+// from the screen's foreground hook and the hotbar layer.
+
+/// `minecraft:filled_map`, resolved at registration.
+static FILLED_MAP: OnceLock<ItemKey> = OnceLock::new();
+
+/// The map id of a filled map stack.
+fn map_id_of(stack: &ItemStack) -> Option<i32> {
+    if Some(&stack.item()) != FILLED_MAP.get() {
+        return None;
+    }
+    components(stack)?.get("minecraft:map_id").and_then(int)
+}
+
+/// Draws map `id`'s picture over a 16 x 16 icon at `at`, then the stack count back on top, once
+/// the picture is here; asks for it otherwise. True when drawn.
+fn draw_slot_map(draw: &mut dyn DrawContext, at: [f32; 2], id: i32, count: u32) -> bool {
+    let cell = with_cache(|cache| {
+        cache.on_slots.insert(id);
+        cache.ready(id)
+    });
+    let Some(cell) = cell else {
+        return false;
+    };
+    let [x, y] = at;
+    draw.fill([x, y, 16.0, 16.0], MAP_PAPER);
+    draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x, y, 16.0, 16.0], None);
+    if count > 1 {
+        let text = count.to_string();
+        let width = draw.text_width(&text);
+        draw.text(&text, [x + 17.0 - width, y + 9.0], TEXT_WHITE, true);
+    }
+    true
+}
+
+/// The maps in the open menu (the player's inventory when none is): slot, map id and count.
+#[derive(Clone, Default)]
+struct Scan {
+    menu_slots: usize,
+    maps: Vec<(usize, i32, u32)>,
+}
+
+static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
+/// The tick to read the menu again at (0: on the regular beat), set by clicks and keys.
+static RESCAN_AT: AtomicU64 = AtomicU64::new(0);
+
+fn local_menu(host: &dyn ClientHost) -> Option<mod_api::MenuRef> {
+    let player = host.local_player()?;
+    player.container_menu(host as &dyn mod_api::Host)
+}
+
+fn scan_menu(host: &dyn ClientHost) -> Option<Scan> {
+    let menu = local_menu(host)?;
+    let read = host as &dyn mod_api::Host;
+    let menu_slots = menu.slot_count(read)?;
+    let mut maps = Vec::new();
+    for slot in 0..menu_slots {
+        if let Some(Some(stack)) = menu.slot(read, slot)
+            && let Some(id) = map_id_of(&stack)
+        {
+            maps.push((slot, id, stack.count()));
+        }
+    }
+    Some(Scan { menu_slots, maps })
+}
+
+/// Reads the menu again soon: now, and once more after the server's slot update.
+fn rescan_soon(tick: u64) {
+    RESCAN_AT.store(tick + 3, Ordering::Relaxed);
+}
+
+fn current_scan() -> Option<Scan> {
+    SCAN.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ctrl lock: a contents panel that stays put while the mouse reads it
+// ---------------------------------------------------------------------------------------------
+
+/// A locked contents panel.
+struct Locked {
+    title: String,
+    contents: Contents,
+    at: [f32; 2],
+    /// The screen it was locked on; another screen unlocks it.
+    screen: String,
+    menu: Option<String>,
+    /// Where it was last drawn.
+    layout: Option<PanelLayout>,
+}
+
+/// The contents panel drawn last, which Ctrl locks.
+struct Candidate {
+    tick: u64,
+    title: String,
+    contents: Contents,
+    at: [f32; 2],
+}
+
+static LOCK: Mutex<Option<Locked>> = Mutex::new(None);
+static CANDIDATE: Mutex<Option<Candidate>> = Mutex::new(None);
+/// A mouse press over the locked panel was eaten, so its release is too.
+static PRESS_EATEN: AtomicBool = AtomicBool::new(false);
+
+/// The locked panel's rectangle, when one is locked and drawn.
+fn locked_rect() -> Option<PanelLayout> {
+    LOCK.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()?
+        .layout
+}
+
+fn unlock() {
+    *LOCK.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn is_control(key: &str) -> bool {
+    matches!(
+        key,
+        "key.keyboard.left.control" | "key.keyboard.right.control"
+    )
+}
+
+/// A text component stored as NBT (a string, or a compound as JSON describes one) as `Text`.
+fn text_from_tag(host: &dyn ClientHost, tag: &Tag) -> Option<Text> {
+    match tag {
+        Tag::String(text) => Some(Text::literal(text.to_string_lossy())),
+        Tag::Compound(_) | Tag::List(_) => host.text_from_json(&tag_json(tag)).ok().flatten(),
+        _ => None,
+    }
+}
+
+/// An NBT tag written as JSON: what a text component's NBT form says, in its JSON form.
+fn tag_json(tag: &Tag) -> String {
+    fn quote(text: &str, out: &mut String) {
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    fn write(tag: &Tag, out: &mut String) {
+        match tag {
+            Tag::String(text) => quote(&text.to_string_lossy(), out),
+            // Text components keep their flags (bold, italic...) as bytes.
+            Tag::Byte(v) => out.push_str(if *v != 0 { "true" } else { "false" }),
+            Tag::Short(v) => out.push_str(&v.to_string()),
+            Tag::Int(v) => out.push_str(&v.to_string()),
+            Tag::Long(v) => out.push_str(&v.to_string()),
+            Tag::Float(bits) => out.push_str(&f32::from_bits(*bits).to_string()),
+            Tag::Double(bits) => out.push_str(&f64::from_bits(*bits).to_string()),
+            Tag::Compound(map) => {
+                out.push('{');
+                for (i, (key, value)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    quote(&key.to_string_lossy(), out);
+                    out.push(':');
+                    write(value, out);
+                }
+                out.push('}');
+            }
+            Tag::List(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            Tag::IntArray(items) => {
+                let list: Vec<String> = items.iter().map(i32::to_string).collect();
+                out.push_str(&format!("[{}]", list.join(",")));
+            }
+            _ => out.push_str("null"),
+        }
+    }
+    let mut out = String::new();
+    write(tag, &mut out);
+    out
+}
+
+/// `text` under a parent of colour `color` (a name or `#RRGGBB`), italic when asked: its own style
+/// wins where it sets one.
+fn styled(text: Text, color: &str, italic: bool) -> Text {
+    let mut style = TextStyle::default();
+    style.color = Some(color.to_string());
+    if italic {
+        style.italic = Some(true);
+    }
+    Text::literal("").with_style(style).append(text)
+}
+
+/// The tooltip lines of an item inside a locked panel: its name, enchantments, map id, lore, and
+/// the Shift hint for something that holds items.
+fn item_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<Text> {
+    let root = components(stack).unwrap_or(Tag::Compound(Default::default()));
+    let mut lines = Vec::new();
+    let name = root
+        .get("minecraft:custom_name")
+        .and_then(|tag| text_from_tag(host, tag))
+        .map(|name| styled(name, "white", true))
+        .unwrap_or_else(|| Text::literal(host.hover_name(stack)));
+    lines.push(name);
+    for key in ["minecraft:enchantments", "minecraft:stored_enchantments"] {
+        let Some(enchantments) = root.get(key) else {
+            continue;
+        };
+        let levels = enchantments.get("levels").unwrap_or(enchantments);
+        let Tag::Compound(levels) = levels else {
+            continue;
+        };
+        for (id, level) in levels {
+            let id = id.to_string_lossy();
+            let Some(level) = int(level) else {
+                continue;
+            };
+            let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id.as_str()));
+            let name = host
+                .translate(&format!("enchantment.{namespace}.{path}"))
+                .unwrap_or_else(|| path.replace('_', " "));
+            let line = if level > 1 {
+                let roman = host
+                    .translate(&format!("enchantment.level.{level}"))
+                    .unwrap_or_else(|| level.to_string());
+                format!("{name} {roman}")
+            } else {
+                name
+            };
+            let color = if path.contains("curse") {
+                "red"
+            } else {
+                "gray"
+            };
+            lines.push(styled(Text::literal(line), color, false));
+        }
+    }
+    if let Some(id) = root.get("minecraft:map_id").and_then(int) {
+        lines.push(styled(Text::literal(format!("Map #{id}")), "gray", false));
+    }
+    if let Some(Tag::List(lore)) = root.get("minecraft:lore") {
+        for line in lore {
+            if let Some(line) = text_from_tag(host, line) {
+                lines.push(styled(line, "dark_purple", true));
+            }
+        }
+    }
+    if matches!(view_of(host, stack, true), Some(View::Contents(_))) {
+        lines.push(styled(
+            Text::literal("Hold Shift to view contents"),
+            "#FF5555",
+            false,
+        ));
+    }
+    lines
+}
+
+/// Vanilla's tooltip colours, for a map shown from a locked panel.
+const TIP_BACKGROUND: u32 = 0xF010_0010;
+const TIP_TOP: u32 = 0xF050_00FF;
+const TIP_BOTTOM: u32 = 0xF028_007F;
+
+/// A vanilla tooltip box around content `[x, y, w, h]`.
+fn tooltip_box(draw: &mut dyn DrawContext, rect: [f32; 4]) {
+    let [x, y, w, h] = rect;
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, h + 8.0], TIP_BACKGROUND);
+    draw.fill([x - 3.0, y - 4.0, w + 6.0, 1.0], TIP_TOP);
+    draw.fill([x - 3.0, y + h + 3.0, w + 6.0, 1.0], TIP_BOTTOM);
+    draw.fill_gradient([x - 3.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
+    draw.fill_gradient([x + w + 2.0, y - 3.0, 1.0, h + 6.0], TIP_TOP, TIP_BOTTOM);
+}
+
+/// What hovering `stack` in a locked panel shows at `mouse`: its own contents panel (with Shift),
+/// its map picture, or its tooltip.
+fn show_inner(
+    host: &dyn ClientHost,
+    draw: &mut dyn DrawContext,
+    stack: &ItemStack,
+    mouse: [f32; 2],
+) {
+    let screen = draw.size();
+    let name = host.hover_name(stack);
+    if host.modifiers().shift()
+        && let Some(View::Contents(contents)) = view_of(host, stack, true)
+    {
+        let [pw, ph] = panel_size(draw, &name, &contents);
+        let at = place(mouse, screen, pw, ph);
+        draw_contents_at(draw, at, &name, &contents, None);
+        return;
+    }
+    if let Some(id) = map_id_of(stack) {
+        let cell = with_cache(|cache| {
+            cache.hovered = Some(id);
+            cache.ready(id)
+        });
+        if let Some(cell) = cell {
+            let outer = MAP_SIZE as f32 * MAP_SCALE + HELD_FRAME * 2.0;
+            let mut lines = vec![format!("Map #{id}")];
+            if let Some((scale, locked)) = map_info(id) {
+                lines.push(format!("Scale 1:{}", 1u32 << scale));
+                lines.push(if locked { "Locked" } else { "Unlocked" }.to_string());
+            }
+            let w = lines
+                .iter()
+                .map(|line| draw.text_width(line))
+                .fold(outer.max(draw.text_width(&name)), f32::max);
+            let h = 12.0 + outer + 4.0 + lines.len() as f32 * 10.0;
+            let [x, y] = place(mouse, screen, w + 8.0, h + 8.0);
+            let (x, y) = (x + 4.0, y + 4.0);
+            tooltip_box(draw, [x, y, w, h]);
+            draw.text(&name, [x, y], TEXT_WHITE, true);
+            draw_framed_map(host, draw, [x, y + 12.0], cell);
+            for (i, line) in lines.iter().enumerate() {
+                let ly = y + 12.0 + outer + 4.0 + i as f32 * 10.0;
+                draw.text(line, [x, ly], 0xFFAA_AAAA, true);
+            }
+            return;
+        }
+    }
+    let _ = draw.gui_tooltip(&item_lines(host, stack), mouse);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -744,16 +1195,28 @@ impl Hooks for UniversalViewer {
         );
         *REQUEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
 
-        // The picture on the slot icon of every filled map.
+        // The map picture inside a map's tooltip.
         let map = r.item_key("minecraft:filled_map");
+        let _ = FILLED_MAP.set(map);
         r.item_part(map, MapIcon);
     }
 
     /// Once a tick: ask the server for the maps on screen, and upload the atlas when it changed.
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _: &mut ClientTickPreEvent) {
-        let asks = with_cache(|cache| {
+        let tick = with_cache(|cache| {
             cache.tick += 1;
-            let tick = cache.tick;
+            cache.tick
+        });
+        // The open menu's maps, a few times a second and soon after a click.
+        let rescan_at = RESCAN_AT.load(Ordering::Relaxed);
+        if tick % SCAN_EVERY == 0 || (rescan_at != 0 && tick >= rescan_at) {
+            if tick >= rescan_at {
+                RESCAN_AT.store(0, Ordering::Relaxed);
+            }
+            let scan = scan_menu(&*host);
+            *SCAN.lock().unwrap_or_else(|p| p.into_inner()) = scan;
+        }
+        let asks = with_cache(|cache| {
             let hovered = cache.hovered.take();
             let on_slots = std::mem::take(&mut cache.on_slots);
             let mut asks = Vec::new();
@@ -844,7 +1307,11 @@ impl Hooks for UniversalViewer {
 
     /// Repaints a placed shulker box's screen panel and slots in the box's colour, under its
     /// items and labels.
-    fn screen_render_background(&self, _: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
+    fn screen_render_background(
+        &self,
+        _: &dyn ClientHost,
+        event: &mut ScreenRenderBackgroundEvent<'_>,
+    ) {
         let Some(([x, y], tint)) = shulker_screen(event.screen) else {
             return;
         };
@@ -873,19 +1340,32 @@ impl Hooks for UniversalViewer {
     }
 
     /// On a dark box, writes the screen's labels again in white so they stay readable.
-    fn screen_render_foreground(&self, host: &dyn ClientHost, event: &mut ScreenRenderForegroundEvent<'_>) {
+    fn screen_render_foreground(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenRenderForegroundEvent<'_>,
+    ) {
+        draw_menu_maps(host, &mut *event.draw, event.screen.mouse);
         let Some(([x, y], tint)) = shulker_screen(event.screen) else {
             return;
         };
         if !dark_face(tint) {
             return;
         }
-        let title = event.screen.title.map(|t| plain(host, t)).unwrap_or_default();
+        let title = event
+            .screen
+            .title
+            .map(|t| plain(host, t))
+            .unwrap_or_default();
         let inventory = host
             .translate("container.inventory")
             .unwrap_or_else(|| "Inventory".to_string());
-        event.draw.text(&title, [x + 8.0, y + 6.0], TEXT_WHITE, true);
-        event.draw.text(&inventory, [x + 8.0, y + 72.0], TEXT_WHITE, true);
+        event
+            .draw
+            .text(&title, [x + 8.0, y + 6.0], TEXT_WHITE, true);
+        event
+            .draw
+            .text(&inventory, [x + 8.0, y + 72.0], TEXT_WHITE, true);
     }
 
     /// A hint on things that hold items, so the Shift trick is discoverable.
@@ -910,7 +1390,16 @@ impl Hooks for UniversalViewer {
     }
 
     /// Takes the hover over for a map (always) or a container/bundle (with Shift held).
-    fn render_tooltip_pre(&self, host: &dyn ClientHost, event: &mut RenderTooltipPreEvent<'_>) -> Flow {
+    fn render_tooltip_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut RenderTooltipPreEvent<'_>,
+    ) -> Flow {
+        // Under a locked panel the panel answers the hover (`screen_render_post`).
+        let cursor = [event.place.x as f32, event.place.y as f32];
+        if locked_rect().is_some_and(|layout| layout.contains(cursor)) {
+            return Flow::Cancel;
+        }
         let Some(stack) = event.stack else {
             return Flow::Continue;
         };
@@ -927,12 +1416,22 @@ impl Hooks for UniversalViewer {
                 TooltipElement::Image(_) => None,
             })
             .unwrap_or_default();
-        let cursor = [event.place.x, event.place.y];
-        let screen = [event.screen_width, event.screen_height];
+        let screen = [event.screen_width as f32, event.screen_height as f32];
         let draw = &mut *event.draw;
 
         match view {
-            View::Contents(contents) => draw_contents(draw, cursor, screen, &title, &contents),
+            View::Contents(contents) => {
+                let [pw, ph] = panel_size(draw, &title, &contents);
+                let at = place(cursor, screen, pw, ph);
+                draw_contents_at(draw, at, &title, &contents, Some(lock_hint(false)));
+                let tick = with_cache(|cache| cache.tick);
+                *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = Some(Candidate {
+                    tick,
+                    title,
+                    contents,
+                    at,
+                });
+            }
             View::Map(id) => {
                 // The picture is a component of the game's own tooltip (`add_map_to_tooltip`).
                 with_cache(|cache| cache.hovered = Some(id));
@@ -941,16 +1440,180 @@ impl Hooks for UniversalViewer {
         }
         Flow::Cancel
     }
+
+    /// Maps on the hotbar, drawn over its items.
+    fn gui_layer_post(&self, _: &dyn ClientHost, event: &mut GuiLayerPostEvent<'_>) {
+        if event.layer != "minecraft:hotbar" {
+            return;
+        }
+        let Some(scan) = current_scan() else {
+            return;
+        };
+        // The player's inventory menu holds the hotbar at 36..45; any other menu ends with it.
+        let first = match scan.menu_slots {
+            46 => 36,
+            n if n >= 9 => n - 9,
+            _ => return,
+        };
+        let draw = &mut *event.draw;
+        let [w, h] = draw.size();
+        let left = (w / 2.0).floor() - 88.0;
+        for (slot, id, count) in scan.maps {
+            if (first..first + 9).contains(&slot) {
+                let at = [left + (slot - first) as f32 * 20.0, h - 19.0];
+                draw_slot_map(draw, at, id, count);
+            }
+        }
+    }
+
+    /// Ctrl over a contents panel locks it in place (or unlocks it).
+    fn screen_key_pressed_pre(
+        &self,
+        _: &dyn ClientHost,
+        event: &mut ScreenKeyPressedPreEvent<'_>,
+    ) -> Flow {
+        let tick = with_cache(|cache| cache.tick);
+        if !is_control(event.key) {
+            // A key can move items (a hotbar number, Q): look at the slots again soon.
+            rescan_soon(tick);
+            return Flow::Continue;
+        }
+        if event.repeat {
+            return Flow::Continue;
+        }
+        let mut lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if lock.is_some() {
+            *lock = None;
+            return Flow::Continue;
+        }
+        let candidate = CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(candidate) = candidate
+            && tick.saturating_sub(candidate.tick) <= 2
+        {
+            *lock = Some(Locked {
+                title: candidate.title,
+                contents: candidate.contents,
+                at: candidate.at,
+                screen: event.screen.id.to_string(),
+                menu: event.screen.menu.map(str::to_string),
+                layout: None,
+            });
+        }
+        Flow::Continue
+    }
+
+    /// A click on the locked panel stays on it, so it never takes the slot underneath.
+    fn screen_mouse_button_pressed_pre(
+        &self,
+        _: &dyn ClientHost,
+        event: &mut ScreenMouseButtonPressedPreEvent<'_>,
+    ) -> Flow {
+        if locked_rect().is_some_and(|layout| layout.contains(event.screen.mouse)) {
+            PRESS_EATEN.store(true, Ordering::Relaxed);
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    fn screen_mouse_button_released_pre(
+        &self,
+        _: &dyn ClientHost,
+        _: &mut ScreenMouseButtonReleasedPreEvent<'_>,
+    ) -> Flow {
+        if PRESS_EATEN.swap(false, Ordering::Relaxed) {
+            return Flow::Cancel;
+        }
+        // A click may have moved a map: look at the slots again soon.
+        rescan_soon(with_cache(|cache| cache.tick));
+        Flow::Continue
+    }
+
+    /// The locked panel, over everything, and what the mouse points at in it.
+    fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+        let mut guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(locked) = guard.as_mut() else {
+            return;
+        };
+        if event.screen.id != locked.screen || event.screen.menu != locked.menu.as_deref() {
+            *guard = None;
+            return;
+        }
+        let draw = &mut *event.draw;
+        let layout = draw_contents_at(
+            draw,
+            locked.at,
+            &locked.title,
+            &locked.contents,
+            Some(lock_hint(true)),
+        );
+        locked.layout = Some(layout);
+        let mouse = event.screen.mouse;
+        let contents = &locked.contents;
+        let Some(cell) = layout.cell_at(mouse, contents.columns, contents.rows) else {
+            return;
+        };
+        let Some((_, stack)) = contents.slots.iter().find(|(slot, _)| *slot == cell) else {
+            return;
+        };
+        let sx = layout.grid[0] + (cell % contents.columns) as f32 * SLOT;
+        let sy = layout.grid[1] + (cell / contents.columns) as f32 * SLOT;
+        draw.fill([sx + 1.0, sy + 1.0, 16.0, 16.0], 0x80FF_FFFF);
+        let stack = stack.clone();
+        drop(guard);
+        show_inner(host, draw, &stack, mouse);
+    }
+
+    /// Leaving the screen unlocks its panel.
+    fn screen_closing(&self, _: &dyn ClientHost, _: &mut ScreenClosingEvent<'_>) {
+        unlock();
+        *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        RESCAN_AT.store(1, Ordering::Relaxed);
+    }
 }
 
-/// Draws a filled map's picture over its slot icon, once the picture is here.
+/// Draws the maps of the open menu over their slots, with the hover highlight back on top.
+fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32; 2]) {
+    let Some(scan) = current_scan() else {
+        return;
+    };
+    if scan.maps.is_empty() {
+        return;
+    }
+    let Some(boxes) = local_menu(host).and_then(|menu| menu.slot_boxes(host)) else {
+        return;
+    };
+    if boxes.len() != scan.menu_slots {
+        // Another menu than the one read: read this one.
+        RESCAN_AT.store(1, Ordering::Relaxed);
+        return;
+    }
+    for (slot, id, count) in scan.maps {
+        let Some(Some([x, y, w, h])) = boxes.get(slot).copied() else {
+            continue;
+        };
+        if draw_slot_map(draw, [x, y], id, count)
+            && mouse[0] >= x
+            && mouse[0] < x + w
+            && mouse[1] >= y
+            && mouse[1] < y + h
+        {
+            draw.fill([x, y, 16.0, 16.0], 0x80FF_FFFF);
+        }
+    }
+}
+
+/// The map picture component of a map's tooltip.
 #[derive(Default)]
 pub struct MapIcon;
 
 #[mod_api::horizon_part]
 impl ItemPart for MapIcon {
     /// The map picture component `add_map_to_tooltip` put in the tooltip.
-    fn tooltip_component_draw(&self, host: &dyn ClientHost, event: &mut TooltipComponentDrawEvent<'_>) {
+    fn tooltip_component_draw(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut TooltipComponentDrawEvent<'_>,
+    ) {
         let Some(View::Map(id)) = view_of(host, event.stack, false) else {
             return;
         };
@@ -958,30 +1621,6 @@ impl ItemPart for MapIcon {
             return;
         };
         draw_framed_map(host, &mut *event.draw, event.origin, cell);
-    }
-
-    fn item_decorations(&self, host: &dyn ClientHost, event: &mut ItemDecorationsEvent<'_>) {
-        let Some(View::Map(id)) = view_of(host, event.stack, false) else {
-            return;
-        };
-        let cell = with_cache(|cache| {
-            cache.on_slots.insert(id);
-            cache.ready(id)
-        });
-        let Some(cell) = cell else {
-            return;
-        };
-        let (x, y) = (event.x, event.y);
-        // The whole picture over the vanilla icon, edge to edge, then the stack count back on top
-        // where vanilla puts it.
-        event.draw.fill([x, y, 16.0, 16.0], MAP_PAPER);
-        event.draw.sprite(MOD_IMAGE_SPRITE, cell_rect(cell), [x, y, 16.0, 16.0], None);
-        let count = event.stack.count();
-        if count > 1 {
-            let text = count.to_string();
-            let width = event.draw.text_width(&text);
-            event.draw.text(&text, [x + 17.0 - width, y + 9.0], TEXT_WHITE, true);
-        }
     }
 }
 
