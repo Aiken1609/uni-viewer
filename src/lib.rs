@@ -44,8 +44,11 @@ const COLUMNS: usize = 9;
 const REFRESH_TICKS: u64 = 100;
 /// Ticks before a map shown only on its slot icon is asked for again.
 const ICON_REFRESH_TICKS: u64 = 400;
-/// At most this many map requests go out per tick (a chest full of maps opens gradually).
-const ASKS_PER_TICK: usize = 4;
+/// At most this many map requests go out per tick, on every other tick: ten a second, the most a
+/// server running this mod answers for one player (a chest full of maps opens gradually).
+const ASKS_PER_TICK: usize = 1;
+/// The most map requests a server answers per player per second.
+const REPLIES_PER_SECOND: u32 = 10;
 /// Ticks between two uploads of the map atlas.
 const UPLOAD_EVERY: u64 = 4;
 /// The mod-image slot is 1024 x 1024 pixels: an 8 x 8 grid of 128 px maps.
@@ -1376,7 +1379,7 @@ impl Hooks for UniversalViewer {
                 if cache.vanilla.contains_key(&id) && cache.maps.contains_key(&id) {
                     continue;
                 }
-                if asks.len() >= ASKS_PER_TICK || asks.contains(&id) {
+                if tick % 2 == 1 || asks.len() >= ASKS_PER_TICK || asks.contains(&id) {
                     continue;
                 }
                 let have = cache.maps.contains_key(&id);
@@ -1790,10 +1793,23 @@ impl ItemPart for MapIcon {
 /// Never returns an error: a failed handler disconnects the player.
 fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
     let id = request.id.0;
+    let Ok(player) = cx.player() else {
+        return Ok(());
+    };
+    // Bounded work: a player gets at most `REPLIES_PER_SECOND` answers a second.
+    if !allow_reply(player) {
+        return Ok(());
+    }
     let state = {
         let Ok(host) = cx.server_host() else {
             return Ok(());
         };
+        // Only a map the player can see: one they carry or that the menu they have open
+        // shows, directly or inside a shulker box or bundle there (what the Shift preview
+        // shows them).
+        if !player_sees_map(&*host, player, id) {
+            return Ok(());
+        }
         // Maps belong to the world, so any level reaches them.
         let Some(level) = host.level("minecraft:overworld") else {
             return Ok(());
@@ -1823,6 +1839,77 @@ fn on_map_request(request: MapRequest, cx: &mut dyn IPayloadContext) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Requests answered per player in the current second.
+static REPLY_BUDGET: Mutex<Option<HashMap<mod_api::PlayerRef, (std::time::Instant, u32)>>> =
+    Mutex::new(None);
+
+/// Whether `player` may have one more map answered this second.
+fn allow_reply(player: mod_api::PlayerRef) -> bool {
+    let now = std::time::Instant::now();
+    let mut guard = REPLY_BUDGET.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = guard.get_or_insert_with(HashMap::new);
+    // Forget players idle for a while, so the table stays as small as the player list.
+    budget.retain(|_, (since, _)| now.duration_since(*since).as_secs() < 10);
+    let (since, used) = budget.entry(player).or_insert((now, 0));
+    if now.duration_since(*since).as_secs_f32() >= 1.0 {
+        *since = now;
+        *used = 0;
+    }
+    if *used >= REPLIES_PER_SECOND {
+        return false;
+    }
+    *used += 1;
+    true
+}
+
+/// Adds the map ids an item shows to `out`: its own, and those of the items it holds (a shulker
+/// box's or a bundle's), two levels deep. `root` is the item's components.
+fn collect_map_ids(root: &Tag, out: &mut HashSet<i32>, depth: u32) {
+    if let Some(id) = root.get("minecraft:map_id").and_then(int) {
+        out.insert(id);
+    }
+    if depth >= 2 {
+        return;
+    }
+    for key in ["minecraft:container", "minecraft:bundle_contents"] {
+        let Some(Tag::List(entries)) = root.get(key) else {
+            continue;
+        };
+        for entry in entries {
+            // A container entry is `{slot, item}`; a bundle's is the item itself.
+            let item = entry.get("item").unwrap_or(entry);
+            if let Some(components) = item.get("components") {
+                collect_map_ids(components, out, depth + 1);
+            }
+        }
+    }
+}
+
+/// Server: whether map `id` is in what `player` can see: their inventory, or the slots of the
+/// menu they have open (a chest's, a shulker box's, their ender chest's), held items included.
+fn player_sees_map(host: &dyn mod_api::ServerHost, player: mod_api::PlayerRef, id: i32) -> bool {
+    let mut seen = HashSet::new();
+    let mut look = |stack: &ItemStack| {
+        if let Some(root) = components(stack) {
+            collect_map_ids(&root, &mut seen, 0);
+        }
+    };
+    let read = host as &dyn mod_api::Host;
+    for (_, stack) in player.inventory_slots(read).unwrap_or_default() {
+        look(&stack);
+    }
+    if let Some(menu) = player.container_menu(read)
+        && let Some(count) = menu.slot_count(read)
+    {
+        for slot in 0..count {
+            if let Some(Some(stack)) = menu.slot(read, slot) {
+                look(&stack);
+            }
+        }
+    }
+    seen.contains(&id)
 }
 
 /// Client: one slice of a map's colours. Once all slices are in, keep the picture as RGBA.

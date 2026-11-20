@@ -75,8 +75,9 @@ ada di Options > Mods > Universal Viewer.
   diterima. Di singleplayer, dan di server yang juga memasang mod ini, map di chest langsung tampil.
 - Maksimal 64 gambar map disimpan sekaligus. Map yang paling lama tidak terlihat diganti saat ada map baru.
 - Posisi map di slot dibaca beberapa kali per detik, bukan setiap frame, supaya ringan walau ada banyak shulker
-  penuh di layar. Setelah map dipindah, gambarnya bisa terlambat sepersekian detik mengikuti slot barunya. Tab item
-  di creative tetap memakai ikon vanilla.
+  penuh di layar. Setelah map dipindah, gambarnya bisa terlambat sepersekian detik mengikuti slot barunya.
+- Di layar inventory **Creative** (semua tab-nya), map tetap memakai ikon vanilla, karena game tidak memberi posisi
+  slot layar itu ke mod. Tooltip map tetap menampilkan gambarnya.
 - Tooltip item di dalam panel terkunci dibuat oleh mod (nama, enchantment, lore, ID map), jadi baris tambahan dari
   mod lain atau server untuk item itu tidak ikut tampil.
 - Warna layar shulker yang ditaruh mengikuti tata letak layar vanilla (176 x 166). Resource pack yang memindahkan
@@ -96,6 +97,8 @@ icon.png                   ikon mod (PNG persegi, maks 512 x 512)
 
 Data map dibaca lewat mixin di `remote_map_item_data`, karena API mod belum bisa membaca pixel map di client.
 Sebagai cadangan, mod juga punya payload opsional untuk meminta gambar map ke server yang memasang mod ini.
+Server hanya menjawab untuk map yang bisa dilihat pemain itu (di inventory-nya atau di menu yang sedang dia buka,
+termasuk di dalam shulker atau bundle di sana), paling banyak 10 jawaban per detik per pemain.
 Untuk pindah build, ganti `horizon = "..."` di `horizon-mod.toml` dengan commit Nightly tujuan (atau
 `cargo horizon-mod update`), lalu pastikan target mixin masih ada di build itu.
 
