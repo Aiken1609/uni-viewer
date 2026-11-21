@@ -77,8 +77,9 @@ yang terkunci tidak mengambil item di slot di bawahnya. Pengaturannya ada di Opt
 - Maksimal 64 gambar map disimpan sekaligus. Map yang paling lama tidak terlihat diganti saat ada map baru.
 - Posisi map di slot dibaca beberapa kali per detik, bukan setiap frame, supaya ringan walau ada banyak shulker
   penuh di layar. Setelah map dipindah, gambarnya bisa terlambat sepersekian detik mengikuti slot barunya.
-- Di layar inventory **Creative** (semua tab-nya), map tetap memakai ikon vanilla, karena game tidak memberi posisi
-  slot layar itu ke mod. Tooltip map tetap menampilkan gambarnya.
+- Di layar **Creative**, game tidak memberi posisi slot ke mod, jadi mod menghitungnya sendiri dari tata letak
+  vanilla: map tampil di baris hotbar di semua tab, dan di seluruh inventory di tab inventory. Map di grid item tab
+  lain tetap memakai ikon vanilla.
 - Tooltip item di dalam panel terkunci dibuat oleh mod (nama, enchantment, lore, ID map), jadi baris tambahan dari
   mod lain atau server untuk item itu tidak ikut tampil.
 - Warna layar shulker yang ditaruh mengikuti tata letak layar vanilla (176 x 166). Resource pack yang memindahkan

@@ -1523,7 +1523,7 @@ impl Hooks for UniversalViewer {
         event: &mut ScreenRenderForegroundEvent<'_>,
     ) {
         SCREEN_SEEN.store(with_cache(|cache| cache.tick), Ordering::Relaxed);
-        draw_menu_maps(host, &mut *event.draw, event.screen.mouse);
+        draw_menu_maps(host, &mut *event.draw, event.screen);
         let Some(([x, y], tint)) = shulker_screen(host, event.screen) else {
             return;
         };
@@ -1763,14 +1763,18 @@ impl Hooks for UniversalViewer {
 }
 
 /// Draws the maps of the open menu over their slots, with the hover highlight back on top.
-fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32; 2]) {
+fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, screen: &ScreenView<'_>) {
+    let mouse = screen.mouse;
     let Some(scan) = current_scan() else {
         return;
     };
     if scan.maps.is_empty() {
         return;
     }
-    let Some(boxes) = local_menu(host).and_then(|menu| menu.slot_boxes(host)) else {
+    let boxes = local_menu(host)
+        .and_then(|menu| menu.slot_boxes(host))
+        .or_else(|| creative_slot_boxes(screen, scan.menu_slots));
+    let Some(boxes) = boxes else {
         return;
     };
     if boxes.len() != scan.menu_slots {
@@ -1790,6 +1794,38 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32
             draw.fill([x, y, 16.0, 16.0], 0x80FF_FFFF);
         }
     }
+}
+
+/// The slot boxes of the creative screen, which the engine does not give: the player's inventory
+/// menu (46 slots) placed as `CreativeModeInventoryScreen` places it. Every tab shows the hotbar
+/// along the bottom; only the inventory tab (41 visible slots, against an item tab's 54) shows
+/// the rest of the inventory and the offhand.
+fn creative_slot_boxes(
+    screen: &ScreenView<'_>,
+    menu_slots: usize,
+) -> Option<Vec<Option<[f32; 4]>>> {
+    const INVENTORY_TAB_SLOTS: usize = 41;
+    if screen.id != "creative" || menu_slots != 46 {
+        return None;
+    }
+    let [ox, oy, ..] = screen.rect;
+    let inventory_tab = screen.slots == INVENTORY_TAB_SLOTS;
+    Some(
+        (0..menu_slots)
+            .map(|slot| {
+                let at = match slot {
+                    36..=44 => Some((9.0 + (slot - 36) as f32 * 18.0, 112.0)),
+                    9..=35 if inventory_tab => Some((
+                        9.0 + ((slot - 9) % 9) as f32 * 18.0,
+                        54.0 + ((slot - 9) / 9) as f32 * 18.0,
+                    )),
+                    45 if inventory_tab => Some((35.0, 20.0)),
+                    _ => None,
+                };
+                at.map(|(x, y)| [ox + x, oy + y, 16.0, 16.0])
+            })
+            .collect(),
+    )
 }
 
 /// The map picture component of a map's tooltip.
