@@ -375,8 +375,16 @@ fn stack_from(host: &dyn ClientHost, tag: &Tag) -> Option<ItemStack> {
     }
 }
 
-/// A map, or the contents of a container or bundle; `None` when the stack is neither.
+/// A map, or the contents of a container or bundle (or of the ender chest, as last seen);
+/// `None` when the stack is neither.
 fn view_of(host: &dyn ClientHost, stack: &ItemStack, with_contents: bool) -> Option<View> {
+    if with_contents && is_ender_chest(stack) {
+        let slots = ender_memory(host)?;
+        if slots.is_empty() {
+            return None;
+        }
+        return Some(View::Contents(finish(COLUMNS, 3, slots, ENDER_COLOR)));
+    }
     let root = components(stack)?;
     if let Some(id) = root.get("minecraft:map_id").and_then(int) {
         return Some(View::Map(id));
@@ -1007,6 +1015,8 @@ struct Holder {
 struct Scan {
     menu_slots: usize,
     marks: Vec<(usize, Mark)>,
+    /// Slots matching the search; None when nothing is searched.
+    hits: Option<std::collections::BTreeSet<usize>>,
 }
 
 /// Every shulker box and bundle item, resolved at registration: only these are read for marks.
@@ -1098,6 +1108,9 @@ struct ScanState {
     menu_slots: usize,
     cursor: usize,
     found: std::collections::BTreeMap<usize, Mark>,
+    /// Slots matching the search, and the search they were matched against.
+    hits: std::collections::BTreeSet<usize>,
+    searched: String,
     /// Whether the last tick saw a screen open.
     screen_open: bool,
 }
@@ -1138,6 +1151,8 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
         menu_slots: usize::MAX,
         cursor: 0,
         found: Default::default(),
+        hits: Default::default(),
+        searched: String::new(),
         screen_open,
     });
     if state.menu_slots != menu_slots {
@@ -1149,6 +1164,13 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
     if screen_open && !state.screen_open {
         whole = true;
     }
+    let query = current_query();
+    if query != state.searched {
+        state.searched = query.clone();
+        state.hits.clear();
+        whole = true;
+    }
+    let searching = screen_open && !query.is_empty();
     state.screen_open = screen_open;
     // The player's inventory menu holds the hotbar at 36..45; any other menu ends with it.
     let hotbar_from = if menu_slots == 46 {
@@ -1169,8 +1191,17 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
     for _ in 0..budget {
         let slot = range.start + state.cursor % len;
         state.cursor = (state.cursor + 1) % len;
-        match menu.slot(read, slot) {
-            Some(Some(stack)) => {
+        let stack = match menu.slot(read, slot) {
+            Some(Some(stack)) => Some(stack),
+            _ => None,
+        };
+        if searching && stack.as_ref().is_some_and(|s| matches_search(host, s, &query)) {
+            state.hits.insert(slot);
+        } else {
+            state.hits.remove(&slot);
+        }
+        match stack {
+            Some(stack) => {
                 let mark = match map_id_of(&stack) {
                     Some(id) => Some(Mark::Map(id, stack.count())),
                     None if holders => holder_of(host, &stack).map(Mark::Holder),
@@ -1185,7 +1216,7 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
                     }
                 }
             }
-            _ => {
+            None => {
                 state.found.remove(&slot);
             }
         }
@@ -1203,6 +1234,7 @@ fn current_scan() -> Option<Scan> {
     Some(Scan {
         menu_slots: state.menu_slots,
         marks: state.found.iter().map(|(slot, mark)| (*slot, *mark)).collect(),
+        hits: (!state.searched.is_empty()).then(|| state.hits.clone()),
     })
 }
 
@@ -1547,6 +1579,83 @@ fn show_inner(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The ender chest, as last seen
+// ---------------------------------------------------------------------------------------------
+//
+// The server sends an ender chest's contents only while it is open, so the client remembers them
+// from then: hovering an ender chest item shows what it held the last time it was opened, on the
+// same server or world, until the game closes. Nothing is written to disk.
+
+/// `minecraft:ender_chest`, resolved at registration.
+static ENDER_CHEST: OnceLock<ItemKey> = OnceLock::new();
+/// This mod's own tint for the ender chest panel, `0xRRGGBB`.
+const ENDER_COLOR: u32 = 0x1F_4A4A;
+/// The tick an ender chest screen last drew.
+static ENDER_SEEN: AtomicU64 = AtomicU64::new(0);
+/// The last seen contents, by server address or world folder.
+static ENDER: Mutex<Option<HashMap<String, Vec<(usize, ItemStack)>>>> = Mutex::new(None);
+
+fn is_ender_chest(stack: &ItemStack) -> bool {
+    Some(&stack.item()) == ENDER_CHEST.get()
+}
+
+/// Whose ender chest this is: the server's address, or the singleplayer world's folder.
+fn ender_owner(host: &dyn ClientHost) -> Option<String> {
+    let server = host.client_session().client_server()?;
+    if let Some(folder) = server.save_folder {
+        return Some(format!("world:{folder}"));
+    }
+    server.address.map(|address| format!("server:{address}"))
+}
+
+fn ender_memory(host: &dyn ClientHost) -> Option<Vec<(usize, ItemStack)>> {
+    let owner = ender_owner(host)?;
+    ENDER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()?
+        .get(&owner)
+        .cloned()
+}
+
+/// Whether the open screen is an ender chest's: a 9 x 3 menu titled with the game's own
+/// "Ender Chest" key (a plugin's look-alike with its own title isn't taken for one).
+fn is_ender_screen(screen: &ScreenView<'_>) -> bool {
+    screen.menu == Some("minecraft:generic_9x3")
+        && screen.title.is_some_and(|title| {
+            matches!(&title.content, TextContent::Translatable { key, .. } if key == "container.enderchest")
+        })
+}
+
+/// While an ender chest is open, reads its 27 slots every few ticks.
+fn remember_ender(host: &dyn ClientHost, tick: u64) {
+    if tick.saturating_sub(ENDER_SEEN.load(Ordering::Relaxed)) > 2 || tick % 5 != 0 {
+        return;
+    }
+    let Some(owner) = ender_owner(host) else {
+        return;
+    };
+    let Some(menu) = local_menu(host) else {
+        return;
+    };
+    let read = host as &dyn mod_api::Host;
+    if menu.slot_count(read) != Some(63) {
+        return;
+    }
+    let mut slots = Vec::new();
+    for slot in 0..27 {
+        if let Some(Some(stack)) = menu.slot(read, slot) {
+            slots.push((slot, stack));
+        }
+    }
+    ENDER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(owner, slots);
+}
+
+// ---------------------------------------------------------------------------------------------
 // A placed shulker box's own screen, tinted like the box
 // ---------------------------------------------------------------------------------------------
 
@@ -1666,6 +1775,20 @@ impl Hooks for UniversalViewer {
             .tooltip("universal_viewer.setting.tooltip_map_size.tooltip"),
         );
 
+        // The search field over container screens.
+        let _ = r.register_setting(
+            mod_api::SettingSpec::choice(
+                SEARCH_BOX,
+                "universal_viewer.setting.search_box",
+                [
+                    "universal_viewer.setting.search_box.shown",
+                    "universal_viewer.setting.search_box.hidden",
+                ],
+                0,
+            )
+            .tooltip("universal_viewer.setting.search_box.tooltip"),
+        );
+
         // Options > Controls: the keys, rebindable.
         for (id, key) in KEYS {
             r.register_key_mapping(
@@ -1699,6 +1822,7 @@ impl Hooks for UniversalViewer {
             bundles.insert(r.item_key(&format!("minecraft:{dye}_bundle")));
         }
         let _ = SHULKERS.set(shulkers);
+        let _ = ENDER_CHEST.set(r.item_key("minecraft:ender_chest"));
         let _ = BUNDLES.set(bundles);
 
         // The map picture inside a map's tooltip.
@@ -1719,6 +1843,7 @@ impl Hooks for UniversalViewer {
         }
         // The open menu's maps: a few slots each tick, all of them after a click.
         scan_step(&*host, tick);
+        remember_ender(&*host, tick);
         let asks = with_cache(|cache| {
             let hovered = cache.hovered.take();
             let on_slots = std::mem::take(&mut cache.on_slots);
@@ -1860,7 +1985,11 @@ impl Hooks for UniversalViewer {
         host: &dyn ClientHost,
         event: &mut ScreenRenderForegroundEvent<'_>,
     ) {
-        SCREEN_SEEN.store(with_cache(|cache| cache.tick), Ordering::Relaxed);
+        let tick = with_cache(|cache| cache.tick);
+        SCREEN_SEEN.store(tick, Ordering::Relaxed);
+        if is_ender_screen(event.screen) {
+            ENDER_SEEN.store(tick, Ordering::Relaxed);
+        }
         draw_menu_maps(host, &mut *event.draw, event.screen);
         let Some(([x, y], tint)) = shulker_screen(host, event.screen) else {
             return;
@@ -1934,6 +2063,11 @@ impl Hooks for UniversalViewer {
                 TooltipElement::Image(_) => None,
             })
             .unwrap_or_default();
+        let title = if is_ender_chest(stack) {
+            format!("{title} (last opened)")
+        } else {
+            title
+        };
         let screen = [event.screen_width as f32, event.screen_height as f32];
         let draw = &mut *event.draw;
 
@@ -2000,6 +2134,22 @@ impl Hooks for UniversalViewer {
         host: &dyn ClientHost,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
+        // A focused search field takes every key but Escape, which only lets go of it, so typing
+        // E or a hotbar number never closes the screen or moves an item.
+        {
+            let mut search = SEARCH.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(ui) = search_ui(host, &mut search, event.screen)
+                && ui.widgets.focused().is_some()
+            {
+                if event.key == "key.keyboard.escape" {
+                    ui.widgets.set_focus(host, None);
+                } else {
+                    ui.widgets.key_pressed(host, event.key, event.modifiers);
+                    take_edit(ui);
+                }
+                return Flow::Cancel;
+            }
+        }
         let tick = with_cache(|cache| cache.tick);
         if !is_key(host, KEY_LOCK, event.key) {
             // A key can move items (a hotbar number, Q): look at the slots again soon.
@@ -2035,9 +2185,25 @@ impl Hooks for UniversalViewer {
     /// A click on the locked panel stays on it, so it never takes the slot underneath.
     fn screen_mouse_button_pressed_pre(
         &self,
-        _: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenMouseButtonPressedPreEvent<'_>,
     ) -> Flow {
+        {
+            let mut search = SEARCH.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(ui) = search_ui(host, &mut search, event.screen) {
+                let outcome = ui.widgets.mouse_pressed(
+                    host,
+                    event.screen.mouse,
+                    event.button,
+                    event.modifiers,
+                );
+                take_edit(ui);
+                if outcome.handled() {
+                    PRESS_EATEN.store(true, Ordering::Relaxed);
+                    return Flow::Cancel;
+                }
+            }
+        }
         if locked_rect().is_some_and(|layout| layout.contains(event.screen.mouse)) {
             PRESS_EATEN.store(true, Ordering::Relaxed);
             return Flow::Cancel;
@@ -2060,6 +2226,12 @@ impl Hooks for UniversalViewer {
 
     /// The locked panel, over everything, and what the mouse points at in it.
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+        {
+            let mut search = SEARCH.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(ui) = search_ui(host, &mut search, event.screen) {
+                let _ = ui.widgets.draw(&mut *event.draw, host, event.screen.mouse);
+            }
+        }
         let mut guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let Some(locked) = guard.as_mut() else {
             return;
@@ -2098,11 +2270,140 @@ impl Hooks for UniversalViewer {
         show_inner(host, draw, &stack, mouse);
     }
 
+    /// Typing into a focused search field.
+    fn screen_char_typed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::ScreenCharTypedPreEvent<'_>,
+    ) -> Flow {
+        let mut search = SEARCH.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ui) = search_ui(host, &mut search, event.screen)
+            && ui.widgets.focused().is_some()
+        {
+            ui.widgets.char_typed(host, event.c);
+            take_edit(ui);
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
     /// Leaving the screen unlocks its panel.
     fn screen_closing(&self, _: &dyn ClientHost, _: &mut ScreenClosingEvent<'_>) {
+        *SEARCH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        set_query("");
         unlock();
         *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = None;
         rescan_soon(with_cache(|cache| cache.tick));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Search: a field over the open container that finds items, also inside shulker boxes and bundles
+// ---------------------------------------------------------------------------------------------
+
+/// Outline of a matching slot, and the veil over the rest (this mod's own colours).
+const SEARCH_HIT: u32 = 0xFFFF_D34D;
+const SEARCH_DIM: u32 = 0xA000_0000;
+/// The search field setting: shown (0) or hidden (1).
+const SEARCH_BOX: &str = "search_box";
+
+/// The search field of the open screen.
+struct SearchUi {
+    widgets: mod_api::client::widgets::Widgets,
+    field: mod_api::client::widgets::WidgetId,
+    /// The panel rect it was placed for.
+    rect: [f32; 4],
+}
+
+static SEARCH: Mutex<Option<SearchUi>> = Mutex::new(None);
+/// What the field holds, lowercased and trimmed: what the scan matches against.
+static QUERY: Mutex<String> = Mutex::new(String::new());
+
+fn current_query() -> String {
+    QUERY.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Takes the field's text as the search, and reads the menu again at once when it changed.
+fn set_query(text: &str) {
+    let query = text.trim().to_lowercase();
+    let mut current = QUERY.lock().unwrap_or_else(|p| p.into_inner());
+    if *current != query {
+        *current = query;
+        RESCAN_AT.store(with_cache(|cache| cache.tick) + 1, Ordering::Relaxed);
+    }
+}
+
+/// Whether `stack`'s name, or the name of something inside it (one level of shulker box or
+/// bundle, or the remembered ender chest), holds `query`.
+fn matches_search(host: &dyn ClientHost, stack: &ItemStack, query: &str) -> bool {
+    if host.hover_name(stack).to_lowercase().contains(query) {
+        return true;
+    }
+    let item = stack.item();
+    let holder = SHULKERS.get().is_some_and(|set| set.contains(&item))
+        || BUNDLES.get().is_some_and(|set| set.contains(&item))
+        || is_ender_chest(stack);
+    if !holder {
+        return false;
+    }
+    let Some(View::Contents(contents)) = view_of(host, stack, true) else {
+        return false;
+    };
+    contents
+        .slots
+        .iter()
+        .any(|(_, inner)| host.hover_name(inner).to_lowercase().contains(query))
+}
+
+/// Whether the open screen gets a search field: a container screen whose slots the game places
+/// (not creative, which has its own search), with the setting on.
+fn searchable(host: &dyn ClientHost, screen: &ScreenView<'_>) -> bool {
+    screen.id == "inventory"
+        && host.setting_choice(SEARCH_BOX).unwrap_or(0) == 0
+        && local_menu(host).is_some_and(|menu| menu.slot_boxes(host).is_some())
+}
+
+/// The field above the panel's top left, made (or moved) for `screen`; None where no field goes.
+fn search_ui<'a>(
+    host: &dyn ClientHost,
+    guard: &'a mut Option<SearchUi>,
+    screen: &ScreenView<'_>,
+) -> Option<&'a mut SearchUi> {
+    if !searchable(host, screen) {
+        *guard = None;
+        return None;
+    }
+    if guard.as_ref().is_some_and(|ui| ui.rect != screen.rect) {
+        // The window moved (a resize, the recipe book): place it again, keeping the text.
+        *guard = None;
+    }
+    if guard.is_none() {
+        let [x, y, ..] = screen.rect;
+        let mut field = mod_api::client::widgets::TextField::new([x + 1.0, y - 16.0, 110.0, 14.0], 40);
+        field.suggestion = Some("Search items...".to_string());
+        field.message = "Search".to_string();
+        field.set_value(&current_query());
+        let mut widgets = mod_api::client::widgets::Widgets::new();
+        let id = widgets.add_text_field(field);
+        *guard = Some(SearchUi {
+            widgets,
+            field: id,
+            rect: screen.rect,
+        });
+    }
+    let ui = guard.as_mut()?;
+    // The placeholder shows only while the field is empty.
+    let empty = ui.widgets.text_field(ui.field).is_some_and(|f| f.value().is_empty());
+    if let Some(field) = ui.widgets.text_field_mut(ui.field) {
+        field.suggestion = empty.then(|| "Search items...".to_string());
+    }
+    Some(ui)
+}
+
+/// The field's text after an edit, as the search.
+fn take_edit(ui: &SearchUi) {
+    if let Some(field) = ui.widgets.text_field(ui.field) {
+        set_query(field.value());
     }
 }
 
@@ -2113,7 +2414,7 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, screen: &Sc
     let Some(scan) = current_scan() else {
         return;
     };
-    if scan.marks.is_empty() {
+    if scan.marks.is_empty() && scan.hits.is_none() {
         return;
     }
     let marks = slot_marks(host);
@@ -2138,6 +2439,22 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, screen: &Sc
             && mouse[1] < y + h
         {
             draw.fill([x, y, 16.0, 16.0], 0x80FF_FFFF);
+        }
+    }
+    // The search: every other slot dimmed, the matches outlined.
+    if let Some(hits) = scan.hits {
+        for (slot, rect) in boxes.iter().enumerate() {
+            let Some([x, y, _, _]) = *rect else {
+                continue;
+            };
+            if hits.contains(&slot) {
+                draw.fill([x - 1.0, y - 1.0, 18.0, 1.0], SEARCH_HIT);
+                draw.fill([x - 1.0, y + 16.0, 18.0, 1.0], SEARCH_HIT);
+                draw.fill([x - 1.0, y, 1.0, 16.0], SEARCH_HIT);
+                draw.fill([x + 16.0, y, 1.0, 16.0], SEARCH_HIT);
+            } else {
+                draw.fill([x, y, 16.0, 16.0], SEARCH_DIM);
+            }
         }
     }
 }

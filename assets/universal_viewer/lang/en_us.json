@@ -16,5 +16,9 @@
   "universal_viewer.setting.slot_marks.tooltip": "What a shulker box or bundle shows on its slot: a bar for how full it is (shulker boxes; bundles have their own) and a small icon of the item it holds the most of.",
   "universal_viewer.key.show_contents": "Show contents (grid)",
   "universal_viewer.key.show_list": "Show contents (list)",
-  "universal_viewer.key.lock_preview": "Lock contents preview"
+  "universal_viewer.key.lock_preview": "Lock contents preview",
+  "universal_viewer.setting.search_box": "Search field",
+  "universal_viewer.setting.search_box.shown": "Shown",
+  "universal_viewer.setting.search_box.hidden": "Hidden",
+  "universal_viewer.setting.search_box.tooltip": "A field above container screens that finds items by name, also inside shulker boxes, bundles and the remembered ender chest: matches are outlined and the rest dimmed."
 }

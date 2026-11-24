@@ -24,6 +24,13 @@
 - **Tanda di slot**: shulker box menampilkan bar seberapa penuh isinya di bawah ikonnya, dan shulker box maupun
   bundle menampilkan ikon kecil item yang paling banyak di dalamnya di pojok kiri atas. Bisa diatur (keduanya, bar
   saja, ikon saja, atau mati) di Options > Mods > Universal Viewer.
+- **Ingatan ender chest**: setiap kali ender chest dibuka, isinya diingat. Setelah itu, hover item ender chest sambil
+  tahan **Shift** (grid) atau **Alt** (daftar) untuk melihat isinya terakhir kali dibuka, per server atau per world.
+  Ingatan hanya disimpan selama game berjalan, tidak ditulis ke disk.
+- **Kotak cari**: di atas layar inventory dan container ada kotak **Search items...**. Ketik nama item, maka slot yang
+  berisi item itu, termasuk shulker box, bundle, dan ender chest yang isinya mengandung item tersebut, diberi garis
+  kuning dan slot lainnya digelapkan. Esc melepas kotaknya, menutup layar mengosongkannya. Bisa disembunyikan di
+  Options > Mods > Universal Viewer.
 - **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tahan **Ctrl** untuk mengunci panelnya di
   tempat. Mouse bisa digerakkan ke atas panel untuk membaca setiap item: nama, enchantment, lore, dan gambar map.
   Lepas Ctrl untuk membuka kunci. Di Options > Mods > Universal Viewer, kunci bisa diganti menjadi mode tekan
@@ -73,7 +80,7 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
 yang terkunci tidak mengambil item di slot di bawahnya. Pengaturannya ada di Options > Mods > Universal Viewer:
 **Lock key** (tahan atau tekan), **Tooltip map size** (64, 96, atau 128 px), dan **Shulker and bundle slot marks**
-(bar isi dan item terbanyak, bar saja, item saja, atau mati).
+(bar isi dan item terbanyak, bar saja, item saja, atau mati), dan **Search field** (tampil atau sembunyi).
 
 Ketiga tombolnya bisa diganti di Options > Controls, di bawah nama mod ini: **Show contents (grid)** (bawaan Shift),
 **Show contents (list)** (bawaan Alt), dan **Lock contents preview** (bawaan Ctrl). Untuk Shift, Ctrl, dan Alt, sisi
