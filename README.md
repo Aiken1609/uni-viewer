@@ -119,6 +119,9 @@ Data map dibaca lewat mixin di `remote_map_item_data`, karena API mod belum bisa
 Sebagai cadangan, mod juga punya payload opsional untuk meminta gambar map ke server yang memasang mod ini.
 Server hanya menjawab untuk map yang bisa dilihat pemain itu (di inventory-nya atau di menu yang sedang dia buka,
 termasuk di dalam shulker atau bundle di sana), paling banyak 10 jawaban per detik per pemain.
+Manifest-nya memakai `side = "client"`: server Horizon yang tidak memasang mod ini tetap menerima pemain yang
+memakainya, karena hanya mod `side = "both"` yang dicocokkan saat join. Bagian server di atas tetap jalan di
+singleplayer dan di server yang ikut memasang mod ini.
 Untuk pindah build, ganti `horizon = "..."` di `horizon-mod.toml` dengan commit Nightly tujuan (atau
 `cargo horizon-mod update`), lalu pastikan target mixin masih ada di build itu.
 
