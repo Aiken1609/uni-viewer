@@ -18,6 +18,12 @@
   atau 128 px (bawaan) di Options > Mods > Universal Viewer.
 - **Isi shulker box dan bundle**: tahan **Shift** sambil hover untuk melihat seluruh isinya dalam grid bergaya
   inventory vanilla, berwarna sesuai warna shulker atau bundle-nya (16 warna dye plus versi polos).
+- **Daftar isi (Alt)**: tahan **Alt** sambil hover shulker box atau bundle untuk melihat isinya sebagai daftar:
+  satu baris per jenis item dengan ikon dan jumlah totalnya, dari yang paling banyak, ditambah total item dan slot
+  yang terpakai.
+- **Tanda di slot**: shulker box menampilkan bar seberapa penuh isinya di bawah ikonnya, dan shulker box maupun
+  bundle menampilkan ikon kecil item yang paling banyak di dalamnya di pojok kiri atas. Bisa diatur (keduanya, bar
+  saja, ikon saja, atau mati) di Options > Mods > Universal Viewer.
 - **Kunci tampilan isi (Ctrl)**: saat isi shulker atau bundle tampil, tahan **Ctrl** untuk mengunci panelnya di
   tempat. Mouse bisa digerakkan ke atas panel untuk membaca setiap item: nama, enchantment, lore, dan gambar map.
   Lepas Ctrl untuk membuka kunci. Di Options > Mods > Universal Viewer, kunci bisa diganti menjadi mode tekan
@@ -66,7 +72,8 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
 yang terkunci tidak mengambil item di slot di bawahnya. Pengaturannya ada di Options > Mods > Universal Viewer:
-**Ctrl lock** (tahan atau tekan) dan **Tooltip map size** (64, 96, atau 128 px).
+**Ctrl lock** (tahan atau tekan), **Tooltip map size** (64, 96, atau 128 px), dan **Shulker and bundle slot marks**
+(bar isi dan item terbanyak, bar saja, item saja, atau mati).
 
 ## Batasan
 

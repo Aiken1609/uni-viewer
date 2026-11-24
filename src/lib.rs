@@ -858,11 +858,112 @@ fn draw_slot_map(draw: &mut dyn DrawContext, at: [f32; 2], id: i32, count: u32) 
     true
 }
 
-/// The maps in the open menu (the player's inventory when none is): slot, map id and count.
+/// What the scan found in one slot: a map, or a shulker box or bundle with something inside.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    /// Map id and stack count.
+    Map(i32, u32),
+    Holder(Holder),
+}
+
+/// A shulker box's or bundle's slot marks: how full it is and what it holds most of.
+#[derive(Clone, Copy, PartialEq)]
+struct Holder {
+    /// 0 to 1, by the room each stack takes (a 16-stack item takes four times a 64-stack one's).
+    /// None for a bundle: the game draws a bundle's own fill bar.
+    fill: Option<f32>,
+    /// The item it holds the most of, by count.
+    top: Option<ItemKey>,
+}
+
+/// The marked slots of the open menu (the player's inventory when none is).
 #[derive(Clone, Default)]
 struct Scan {
     menu_slots: usize,
-    maps: Vec<(usize, i32, u32)>,
+    marks: Vec<(usize, Mark)>,
+}
+
+/// Every shulker box and bundle item, resolved at registration: only these are read for marks.
+static SHULKERS: OnceLock<HashSet<ItemKey>> = OnceLock::new();
+static BUNDLES: OnceLock<HashSet<ItemKey>> = OnceLock::new();
+
+/// Slots a shulker box holds.
+const SHULKER_SLOTS: f32 = 27.0;
+
+/// The slot marks setting: which of the fill bar and the top item a shulker box or bundle shows.
+const SLOT_MARKS: &str = "slot_marks";
+
+/// (bar, icon) for the slot marks setting.
+fn slot_marks(host: &dyn ClientHost) -> (bool, bool) {
+    match host.setting_choice(SLOT_MARKS).unwrap_or(0) {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (false, false),
+        _ => (true, true),
+    }
+}
+
+/// The slot marks of a shulker box or bundle stack; None for anything else, or an empty one.
+fn holder_of(host: &dyn ClientHost, stack: &ItemStack) -> Option<Holder> {
+    let item = stack.item();
+    let shulker = SHULKERS.get().is_some_and(|set| set.contains(&item));
+    let bundle = BUNDLES.get().is_some_and(|set| set.contains(&item));
+    if !shulker && !bundle {
+        return None;
+    }
+    let Some(View::Contents(contents)) = view_of(host, stack, true) else {
+        return None;
+    };
+    let read = host as &dyn mod_api::Host;
+    let mut room = 0.0f32;
+    let mut totals: Vec<(ItemKey, u64)> = Vec::new();
+    for (_, inner) in &contents.slots {
+        let key = inner.item();
+        let max = read.max_stack_size(key).unwrap_or(64).max(1);
+        room += inner.count() as f32 / max as f32;
+        match totals.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, total)) => *total += u64::from(inner.count()),
+            None => totals.push((key, u64::from(inner.count()))),
+        }
+    }
+    let top = totals
+        .iter()
+        .max_by_key(|(_, total)| *total)
+        .map(|(key, _)| *key);
+    Some(Holder {
+        fill: shulker.then(|| (room / SHULKER_SLOTS).clamp(0.0, 1.0)),
+        top,
+    })
+}
+
+/// Fill bar colours (this mod's own): filling, and full.
+const BAR_FILLING: u32 = 0xFF70_86FF;
+const BAR_FULL: u32 = 0xFFFF_5555;
+
+/// Draws a shulker box's or bundle's marks over its 16 x 16 icon at `at`.
+fn draw_holder(draw: &mut dyn DrawContext, at: [f32; 2], holder: Holder, marks: (bool, bool)) {
+    let [x, y] = at;
+    let (bar, icon) = marks;
+    if icon && let Some(top) = holder.top {
+        draw.item(top, [x, y], 8.0);
+    }
+    if bar && let Some(fill) = holder.fill {
+        let width = (13.0 * fill).round().max(if fill > 0.0 { 1.0 } else { 0.0 });
+        let color = if fill >= 0.999 { BAR_FULL } else { BAR_FILLING };
+        draw.fill([x + 2.0, y + 13.0, 13.0, 2.0], 0xFF00_0000);
+        draw.fill([x + 2.0, y + 13.0, width, 1.0], color);
+    }
+}
+
+/// Draws one slot's mark at `at`; true when something was drawn.
+fn draw_mark(draw: &mut dyn DrawContext, at: [f32; 2], mark: Mark, marks: (bool, bool)) -> bool {
+    match mark {
+        Mark::Map(id, count) => draw_slot_map(draw, at, id, count),
+        Mark::Holder(holder) => {
+            draw_holder(draw, at, holder, marks);
+            marks.0 || marks.1
+        }
+    }
 }
 
 /// The menu read a few slots a tick, round and round, so no tick reads the whole of a menu full
@@ -870,7 +971,7 @@ struct Scan {
 struct ScanState {
     menu_slots: usize,
     cursor: usize,
-    found: std::collections::BTreeMap<usize, (i32, u32)>,
+    found: std::collections::BTreeMap<usize, Mark>,
     /// Whether the last tick saw a screen open.
     screen_open: bool,
 }
@@ -899,6 +1000,7 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
     let Some(menu_slots) = menu.slot_count(read) else {
         return;
     };
+    let holders = slot_marks(host) != (false, false);
     let screen_open = tick.saturating_sub(SCREEN_SEEN.load(Ordering::Relaxed)) <= 2;
     let rescan_at = RESCAN_AT.load(Ordering::Relaxed);
     let mut whole = rescan_at != 0 && tick >= rescan_at;
@@ -942,14 +1044,21 @@ fn scan_step(host: &dyn ClientHost, tick: u64) {
         let slot = range.start + state.cursor % len;
         state.cursor = (state.cursor + 1) % len;
         match menu.slot(read, slot) {
-            Some(Some(stack)) => match map_id_of(&stack) {
-                Some(id) => {
-                    state.found.insert(slot, (id, stack.count()));
+            Some(Some(stack)) => {
+                let mark = match map_id_of(&stack) {
+                    Some(id) => Some(Mark::Map(id, stack.count())),
+                    None if holders => holder_of(host, &stack).map(Mark::Holder),
+                    None => None,
+                };
+                match mark {
+                    Some(mark) => {
+                        state.found.insert(slot, mark);
+                    }
+                    None => {
+                        state.found.remove(&slot);
+                    }
                 }
-                None => {
-                    state.found.remove(&slot);
-                }
-            },
+            }
             _ => {
                 state.found.remove(&slot);
             }
@@ -967,11 +1076,7 @@ fn current_scan() -> Option<Scan> {
     let state = guard.as_ref()?;
     Some(Scan {
         menu_slots: state.menu_slots,
-        maps: state
-            .found
-            .iter()
-            .map(|(slot, (id, count))| (*slot, *id, *count))
-            .collect(),
+        marks: state.found.iter().map(|(slot, mark)| (*slot, *mark)).collect(),
     })
 }
 
@@ -1172,14 +1277,92 @@ fn item_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<Text> {
         }
     }
     if matches!(view_of(host, stack, true), Some(View::Contents(_))) {
-        lines.push(styled(
-            Text::literal("Hold Shift to view contents"),
-            "#FF5555",
-            false,
-        ));
+        lines.push(styled(Text::literal(CONTENTS_HINT), "#FF5555", false));
     }
     lines
 }
+
+/// The hint under a shulker box or bundle's name.
+const CONTENTS_HINT: &str = "Hold Shift to view contents, Alt for a list";
+
+/// Rows a contents list shows before "and N more".
+const LIST_ROWS: usize = 12;
+
+/// A shulker box's or bundle's contents as a list: one row per kind of item (same item and name),
+/// largest count first, with its icon and total.
+fn draw_summary(
+    host: &dyn ClientHost,
+    draw: &mut dyn DrawContext,
+    cursor: [f32; 2],
+    screen: [f32; 2],
+    title: &str,
+    contents: &Contents,
+) {
+    let mut rows: Vec<(ItemStack, String, u64)> = Vec::new();
+    for (_, stack) in &contents.slots {
+        let name = host.hover_name(stack);
+        let count = u64::from(stack.count());
+        match rows
+            .iter_mut()
+            .find(|(s, n, _)| s.item() == stack.item() && *n == name)
+        {
+            Some((_, _, total)) => *total += count,
+            None => rows.push((stack.clone(), name, count)),
+        }
+    }
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    let more = rows.len().saturating_sub(LIST_ROWS);
+    rows.truncate(LIST_ROWS);
+    let lines: Vec<(String, String)> = rows
+        .iter()
+        .map(|(_, name, total)| (format!("{total}"), name.clone()))
+        .collect();
+    let used = contents.slots.len();
+    let footer = if contents.columns == COLUMNS {
+        format!("{} items, {used}/{} slots", contents.items, contents.columns * contents.rows)
+    } else {
+        format!("{} items", contents.items)
+    };
+    let more_line = (more > 0).then(|| format!("and {more} more"));
+    let count_w = lines
+        .iter()
+        .map(|(count, _)| draw.text_width(count))
+        .fold(0.0, f32::max);
+    let row_w = lines
+        .iter()
+        .map(|(_, name)| 18.0 + count_w + 6.0 + draw.text_width(name))
+        .fold(0.0, f32::max);
+    let w = row_w
+        .max(draw.text_width(title))
+        .max(draw.text_width(&footer))
+        .max(more_line.as_deref().map_or(0.0, |m| draw.text_width(m)));
+    const ROW: f32 = 18.0;
+    let h = 12.0
+        + lines.len() as f32 * ROW
+        + more_line.as_ref().map_or(0.0, |_| 10.0)
+        + 2.0
+        + 10.0;
+    let [x, y] = place(cursor, screen, w + 8.0, h + 8.0);
+    let (x, y) = (x + 4.0, y + 4.0);
+    tooltip_box(draw, [x, y, w, h]);
+    draw.text(title, [x, y], TEXT_WHITE, true);
+    let mut ly = y + 12.0;
+    for ((stack, _, _), (count, name)) in rows.iter().zip(&lines) {
+        draw.item_stack(stack, [x, ly], 16.0);
+        let cw = draw.text_width(count);
+        draw.text(count, [x + 18.0 + count_w - cw, ly + 4.0], 0xFFFF_FF55, true);
+        draw.text(name, [x + 18.0 + count_w + 6.0, ly + 4.0], TEXT_WHITE, true);
+        ly += ROW;
+    }
+    if let Some(more) = &more_line {
+        draw.text(more, [x, ly], LIST_GRAY, true);
+        ly += 10.0;
+    }
+    draw.text(&footer, [x, ly + 2.0], LIST_GRAY, true);
+}
+
+/// Gray text in a contents list.
+const LIST_GRAY: u32 = 0xFFAA_AAAA;
 
 /// Vanilla's tooltip colours, for a map shown from a locked panel.
 const TIP_BACKGROUND: u32 = 0xF010_0010;
@@ -1367,6 +1550,32 @@ impl Hooks for UniversalViewer {
             .tooltip("universal_viewer.setting.tooltip_map_size.tooltip"),
         );
 
+        // The fill bar and top item drawn on shulker boxes and bundles in a slot.
+        let _ = r.register_setting(
+            mod_api::SettingSpec::choice(
+                SLOT_MARKS,
+                "universal_viewer.setting.slot_marks",
+                [
+                    "universal_viewer.setting.slot_marks.both",
+                    "universal_viewer.setting.slot_marks.bar",
+                    "universal_viewer.setting.slot_marks.icon",
+                    "universal_viewer.setting.slot_marks.off",
+                ],
+                0,
+            )
+            .tooltip("universal_viewer.setting.slot_marks.tooltip"),
+        );
+        let mut shulkers = HashSet::new();
+        let mut bundles = HashSet::new();
+        shulkers.insert(r.item_key("minecraft:shulker_box"));
+        bundles.insert(r.item_key("minecraft:bundle"));
+        for (dye, _) in DYES {
+            shulkers.insert(r.item_key(&format!("minecraft:{dye}_shulker_box")));
+            bundles.insert(r.item_key(&format!("minecraft:{dye}_bundle")));
+        }
+        let _ = SHULKERS.set(shulkers);
+        let _ = BUNDLES.set(bundles);
+
         // The map picture inside a map's tooltip.
         let map = r.item_key("minecraft:filled_map");
         let _ = FILLED_MAP.set(map);
@@ -1552,11 +1761,13 @@ impl Hooks for UniversalViewer {
         host: &dyn ClientHost,
         event: &mut RenderTooltipGatherComponentsEvent<'_>,
     ) -> Flow {
-        if !host.modifiers().shift()
+        let modifiers = host.modifiers();
+        if !modifiers.shift()
+            && !modifiers.alt()
             && matches!(view_of(host, event.stack, true), Some(View::Contents(_)))
         {
             event.elements.push(TooltipElement::Text(
-                Text::literal("Hold Shift to view contents"),
+                Text::literal(CONTENTS_HINT),
                 // Bright red (`rgba`).
                 0xFF55_55FF,
             ));
@@ -1583,7 +1794,9 @@ impl Hooks for UniversalViewer {
         };
         let modifiers = host.modifiers();
         let shift = modifiers.shift();
-        let Some(view) = view_of(host, stack, shift) else {
+        // Alt (without Shift) lists the contents instead of drawing their grid.
+        let list = modifiers.alt() && !shift;
+        let Some(view) = view_of(host, stack, shift || list) else {
             return Flow::Continue;
         };
         let title = event
@@ -1598,6 +1811,9 @@ impl Hooks for UniversalViewer {
         let draw = &mut *event.draw;
 
         match view {
+            View::Contents(contents) if list => {
+                draw_summary(host, draw, cursor, screen, &title, &contents);
+            }
             View::Contents(contents) => {
                 let [pw, ph] = panel_size(draw, &title, &contents);
                 let at = place(cursor, screen, pw, ph);
@@ -1626,7 +1842,7 @@ impl Hooks for UniversalViewer {
     }
 
     /// Maps on the hotbar, drawn over its items.
-    fn gui_layer_post(&self, _: &dyn ClientHost, event: &mut GuiLayerPostEvent<'_>) {
+    fn gui_layer_post(&self, host: &dyn ClientHost, event: &mut GuiLayerPostEvent<'_>) {
         if event.layer != "minecraft:hotbar" {
             return;
         }
@@ -1642,10 +1858,11 @@ impl Hooks for UniversalViewer {
         let draw = &mut *event.draw;
         let [w, h] = draw.size();
         let left = (w / 2.0).floor() - 88.0;
-        for (slot, id, count) in scan.maps {
+        let marks = slot_marks(host);
+        for (slot, mark) in scan.marks {
             if (first..first + 9).contains(&slot) {
                 let at = [left + (slot - first) as f32 * 20.0, h - 19.0];
-                draw_slot_map(draw, at, id, count);
+                draw_mark(draw, at, mark, marks);
             }
         }
     }
@@ -1762,15 +1979,17 @@ impl Hooks for UniversalViewer {
     }
 }
 
-/// Draws the maps of the open menu over their slots, with the hover highlight back on top.
+/// Draws the maps, shulker boxes and bundles of the open menu over their slots, with the hover
+/// highlight back on top.
 fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, screen: &ScreenView<'_>) {
     let mouse = screen.mouse;
     let Some(scan) = current_scan() else {
         return;
     };
-    if scan.maps.is_empty() {
+    if scan.marks.is_empty() {
         return;
     }
+    let marks = slot_marks(host);
     let boxes = local_menu(host)
         .and_then(|menu| menu.slot_boxes(host))
         .or_else(|| creative_slot_boxes(screen, scan.menu_slots));
@@ -1781,11 +2000,11 @@ fn draw_menu_maps(host: &dyn ClientHost, draw: &mut dyn DrawContext, screen: &Sc
         // Another menu than the one read; the next tick reads this one.
         return;
     }
-    for (slot, id, count) in scan.maps {
+    for (slot, mark) in scan.marks {
         let Some(Some([x, y, w, h])) = boxes.get(slot).copied() else {
             continue;
         };
-        if draw_slot_map(draw, [x, y], id, count)
+        if draw_mark(draw, [x, y], mark, marks)
             && mouse[0] >= x
             && mouse[0] < x + w
             && mouse[1] >= y

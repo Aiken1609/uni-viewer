@@ -7,5 +7,11 @@
   "universal_viewer.setting.tooltip_map_size.64": "64 px",
   "universal_viewer.setting.tooltip_map_size.96": "96 px",
   "universal_viewer.setting.tooltip_map_size.128": "128 px",
-  "universal_viewer.setting.tooltip_map_size.tooltip": "Ukuran gambar map di tooltip map; bingkainya ikut menyesuaikan."
+  "universal_viewer.setting.tooltip_map_size.tooltip": "Ukuran gambar map di tooltip map; bingkainya ikut menyesuaikan.",
+  "universal_viewer.setting.slot_marks": "Tanda slot shulker dan bundle",
+  "universal_viewer.setting.slot_marks.both": "Bar isi dan item terbanyak",
+  "universal_viewer.setting.slot_marks.bar": "Bar isi saja",
+  "universal_viewer.setting.slot_marks.icon": "Item terbanyak saja",
+  "universal_viewer.setting.slot_marks.off": "Mati",
+  "universal_viewer.setting.slot_marks.tooltip": "Yang tampil di slot shulker box atau bundle: bar seberapa penuh isinya (shulker box; bundle sudah punya bar sendiri) dan ikon kecil item yang paling banyak di dalamnya."
 }

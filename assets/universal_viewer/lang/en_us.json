@@ -7,5 +7,11 @@
   "universal_viewer.setting.tooltip_map_size.64": "64 px",
   "universal_viewer.setting.tooltip_map_size.96": "96 px",
   "universal_viewer.setting.tooltip_map_size.128": "128 px",
-  "universal_viewer.setting.tooltip_map_size.tooltip": "Size of the map picture in a map's tooltip. The frame scales with it."
+  "universal_viewer.setting.tooltip_map_size.tooltip": "Size of the map picture in a map's tooltip. The frame scales with it.",
+  "universal_viewer.setting.slot_marks": "Shulker and bundle slot marks",
+  "universal_viewer.setting.slot_marks.both": "Fill bar and top item",
+  "universal_viewer.setting.slot_marks.bar": "Fill bar only",
+  "universal_viewer.setting.slot_marks.icon": "Top item only",
+  "universal_viewer.setting.slot_marks.off": "Off",
+  "universal_viewer.setting.slot_marks.tooltip": "What a shulker box or bundle shows on its slot: a bar for how full it is (shulker boxes; bundles have their own) and a small icon of the item it holds the most of."
 }
