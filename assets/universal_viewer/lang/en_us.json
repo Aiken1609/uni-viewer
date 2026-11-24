@@ -1,8 +1,8 @@
 {
-  "universal_viewer.setting.lock_mode": "Ctrl lock",
-  "universal_viewer.setting.lock_mode.hold": "Hold Ctrl",
-  "universal_viewer.setting.lock_mode.toggle": "Press Ctrl to toggle",
-  "universal_viewer.setting.lock_mode.tooltip": "How Ctrl locks a shulker box or bundle preview in place: while Ctrl is held, or from one press of Ctrl to the next.",
+  "universal_viewer.setting.lock_mode": "Lock key",
+  "universal_viewer.setting.lock_mode.hold": "Hold to lock",
+  "universal_viewer.setting.lock_mode.toggle": "Press to toggle",
+  "universal_viewer.setting.lock_mode.tooltip": "How the lock key (Ctrl by default, rebindable in Controls) locks a shulker box or bundle preview in place: while it is held, or from one press to the next.",
   "universal_viewer.setting.tooltip_map_size": "Tooltip map size",
   "universal_viewer.setting.tooltip_map_size.64": "64 px",
   "universal_viewer.setting.tooltip_map_size.96": "96 px",
@@ -13,5 +13,8 @@
   "universal_viewer.setting.slot_marks.bar": "Fill bar only",
   "universal_viewer.setting.slot_marks.icon": "Top item only",
   "universal_viewer.setting.slot_marks.off": "Off",
-  "universal_viewer.setting.slot_marks.tooltip": "What a shulker box or bundle shows on its slot: a bar for how full it is (shulker boxes; bundles have their own) and a small icon of the item it holds the most of."
+  "universal_viewer.setting.slot_marks.tooltip": "What a shulker box or bundle shows on its slot: a bar for how full it is (shulker boxes; bundles have their own) and a small icon of the item it holds the most of.",
+  "universal_viewer.key.show_contents": "Show contents (grid)",
+  "universal_viewer.key.show_list": "Show contents (list)",
+  "universal_viewer.key.lock_preview": "Lock contents preview"
 }

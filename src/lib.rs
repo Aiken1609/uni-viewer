@@ -535,13 +535,139 @@ fn vanilla_slot(draw: &mut dyn DrawContext, x: f32, y: f32, tint: u32) {
 }
 
 /// The footer's hint about the Ctrl lock.
-fn lock_hint(locked: bool, toggles: bool) -> &'static str {
+fn lock_hint(locked: bool, toggles: bool) -> String {
+    let key = key_label(KEY_LOCK);
     match (toggles, locked) {
-        (true, false) => "Ctrl: lock",
-        (true, true) => "Ctrl: unlock",
-        (false, false) => "Hold Ctrl: lock",
-        (false, true) => "Locked",
+        (true, false) => format!("{key}: lock"),
+        (true, true) => format!("{key}: unlock"),
+        (false, false) => format!("Hold {key}: lock"),
+        (false, true) => "Locked".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keys: rebindable on Options > Controls
+// ---------------------------------------------------------------------------------------------
+
+const MOD_ID: &str = "universal_viewer";
+/// Held over a shulker box or bundle: its contents as a grid.
+const KEY_CONTENTS: &str = "show_contents";
+/// Held over a shulker box or bundle: its contents as a list.
+const KEY_LIST: &str = "show_list";
+/// Locks a contents panel in place (held, or pressed with the toggle setting).
+const KEY_LOCK: &str = "lock_preview";
+const KEYS: [(&str, &str); 3] = [
+    (KEY_CONTENTS, "key.keyboard.left.shift"),
+    (KEY_LIST, "key.keyboard.left.alt"),
+    (KEY_LOCK, "key.keyboard.left.control"),
+];
+
+/// Each key's binding as the player set it (key name, modifier bits) and its short label, read
+/// once a tick.
+#[derive(Clone)]
+struct Bound {
+    key: String,
+    modifiers: mod_api::ClientModifiers,
+    label: String,
+}
+static BOUND: Mutex<Option<HashMap<&'static str, Bound>>> = Mutex::new(None);
+
+/// Reads every key's binding again (Controls may have changed it).
+fn refresh_keys(host: &dyn ClientHost) {
+    let mut map = HashMap::new();
+    for (id, default) in KEYS {
+        let (key, modifiers) = host
+            .mod_key(MOD_ID, id)
+            .unwrap_or_else(|| (default.to_string(), mod_api::ClientModifiers::default()));
+        let label = short_label(host, &key);
+        map.insert(
+            id,
+            Bound {
+                key,
+                modifiers,
+                label,
+            },
+        );
+    }
+    *BOUND.lock().unwrap_or_else(|p| p.into_inner()) = Some(map);
+}
+
+fn bound(id: &str) -> Option<Bound> {
+    BOUND
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()?
+        .get(id)
+        .cloned()
+}
+
+/// A key's name for a hint: "Shift", "Ctrl" and "Alt" for either side's modifier, else the name
+/// Controls shows.
+fn short_label(host: &dyn ClientHost, key: &str) -> String {
+    for (end, short) in [("shift", "Shift"), ("control", "Ctrl"), ("alt", "Alt")] {
+        if key == format!("key.keyboard.left.{end}") || key == format!("key.keyboard.right.{end}") {
+            return short.to_string();
+        }
+    }
+    host.translate(key).unwrap_or_else(|| {
+        key.rsplit('.')
+            .next()
+            .unwrap_or(key)
+            .to_ascii_uppercase()
+    })
+}
+
+/// The hint label of key `id`.
+fn key_label(id: &str) -> String {
+    bound(id).map_or_else(String::new, |b| b.label)
+}
+
+/// The other side's twin of a left or right modifier key, so either Shift works.
+fn twin(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("key.keyboard.left.") {
+        Some(format!("key.keyboard.right.{rest}"))
+    } else {
+        key.strip_prefix("key.keyboard.right.")
+            .map(|rest| format!("key.keyboard.left.{rest}"))
+    }
+}
+
+/// Whether the held modifiers include the binding's own.
+fn modifiers_hold(host: &dyn ClientHost, wanted: mod_api::ClientModifiers) -> bool {
+    let held = host.modifiers();
+    (!wanted.shift() || held.shift())
+        && (!wanted.control() || held.control())
+        && (!wanted.alt() || held.alt())
+}
+
+/// Whether key `id` is held now: its key (or a modifier key's twin) with its modifiers.
+fn held(host: &dyn ClientHost, id: &str) -> bool {
+    let Some(b) = bound(id) else {
+        return false;
+    };
+    if b.key == "key.keyboard.unknown" {
+        return false;
+    }
+    let down = host.is_key_down(&b.key) || twin(&b.key).is_some_and(|t| host.is_key_down(&t));
+    down && modifiers_hold(host, b.modifiers)
+}
+
+/// Whether a pressed key is key `id`'s.
+fn is_key(host: &dyn ClientHost, id: &str, pressed: &str) -> bool {
+    let Some(b) = bound(id) else {
+        return false;
+    };
+    (b.key == pressed || twin(&b.key).is_some_and(|t| t == pressed))
+        && modifiers_hold(host, b.modifiers)
+}
+
+/// The hint under a shulker box's or bundle's name, with the keys as bound.
+fn contents_hint() -> String {
+    format!(
+        "Hold {} to view contents, {} for a list",
+        key_label(KEY_CONTENTS),
+        key_label(KEY_LIST)
+    )
 }
 
 /// Where a contents panel's parts are, in GUI pixels.
@@ -576,7 +702,7 @@ fn panel_size(draw: &dyn DrawContext, title: &str, contents: &Contents) -> [f32;
     let footer = format!("{} items", contents.items);
     let grid_w = contents.columns as f32 * SLOT;
     let grid_h = contents.rows as f32 * SLOT;
-    let footer_w = draw.text_width(&footer) + 8.0 + draw.text_width(lock_hint(false, false));
+    let footer_w = draw.text_width(&footer) + 8.0 + draw.text_width(&lock_hint(false, false));
     let w = grid_w.max(draw.text_width(title)).max(footer_w);
     let h = 11.0 + grid_h + 11.0;
     [w + PAD * 2.0, h + PAD * 2.0]
@@ -1130,13 +1256,6 @@ fn lock_toggles(host: &dyn ClientHost) -> bool {
     host.setting_choice(LOCK_MODE) == Some(1)
 }
 
-fn is_control(key: &str) -> bool {
-    matches!(
-        key,
-        "key.keyboard.left.control" | "key.keyboard.right.control"
-    )
-}
-
 /// A text component stored as NBT (a string, or a compound as JSON describes one) as `Text`.
 fn text_from_tag(host: &dyn ClientHost, tag: &Tag) -> Option<Text> {
     match tag {
@@ -1277,13 +1396,10 @@ fn item_lines(host: &dyn ClientHost, stack: &ItemStack) -> Vec<Text> {
         }
     }
     if matches!(view_of(host, stack, true), Some(View::Contents(_))) {
-        lines.push(styled(Text::literal(CONTENTS_HINT), "#FF5555", false));
+        lines.push(styled(Text::literal(contents_hint()), "#FF5555", false));
     }
     lines
 }
-
-/// The hint under a shulker box or bundle's name.
-const CONTENTS_HINT: &str = "Hold Shift to view contents, Alt for a list";
 
 /// Rows a contents list shows before "and N more".
 const LIST_ROWS: usize = 12;
@@ -1389,7 +1505,7 @@ fn show_inner(
 ) {
     let screen = draw.size();
     let name = host.hover_name(stack);
-    if host.modifiers().shift()
+    if held(host, KEY_CONTENTS)
         && let Some(View::Contents(contents)) = view_of(host, stack, true)
     {
         let [pw, ph] = panel_size(draw, &name, &contents);
@@ -1550,6 +1666,15 @@ impl Hooks for UniversalViewer {
             .tooltip("universal_viewer.setting.tooltip_map_size.tooltip"),
         );
 
+        // Options > Controls: the keys, rebindable.
+        for (id, key) in KEYS {
+            r.register_key_mapping(
+                mod_api::KeyRegistration::new(id, key)
+                    .label(&format!("universal_viewer.key.{id}"))
+                    .context(mod_api::KeyConflictContext::Gui),
+            );
+        }
+
         // The fill bar and top item drawn on shulker boxes and bundles in a slot.
         let _ = r.register_setting(
             mod_api::SettingSpec::choice(
@@ -1588,6 +1713,10 @@ impl Hooks for UniversalViewer {
             cache.tick += 1;
             cache.tick
         });
+        // Controls may have rebound a key.
+        if tick % 20 == 1 || BOUND.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            refresh_keys(&*host);
+        }
         // The open menu's maps: a few slots each tick, all of them after a click.
         scan_step(&*host, tick);
         let asks = with_cache(|cache| {
@@ -1761,13 +1890,12 @@ impl Hooks for UniversalViewer {
         host: &dyn ClientHost,
         event: &mut RenderTooltipGatherComponentsEvent<'_>,
     ) -> Flow {
-        let modifiers = host.modifiers();
-        if !modifiers.shift()
-            && !modifiers.alt()
+        if !held(host, KEY_CONTENTS)
+            && !held(host, KEY_LIST)
             && matches!(view_of(host, event.stack, true), Some(View::Contents(_)))
         {
             event.elements.push(TooltipElement::Text(
-                Text::literal(CONTENTS_HINT),
+                Text::literal(contents_hint()),
                 // Bright red (`rgba`).
                 0xFF55_55FF,
             ));
@@ -1792,10 +1920,9 @@ impl Hooks for UniversalViewer {
         let Some(stack) = event.stack else {
             return Flow::Continue;
         };
-        let modifiers = host.modifiers();
-        let shift = modifiers.shift();
-        // Alt (without Shift) lists the contents instead of drawing their grid.
-        let list = modifiers.alt() && !shift;
+        let shift = held(host, KEY_CONTENTS);
+        // The list key (without the grid's) lists the contents instead of drawing their grid.
+        let list = held(host, KEY_LIST) && !shift;
         let Some(view) = view_of(host, stack, shift || list) else {
             return Flow::Continue;
         };
@@ -1822,7 +1949,7 @@ impl Hooks for UniversalViewer {
                     at,
                     &title,
                     &contents,
-                    Some(lock_hint(false, lock_toggles(host))),
+                    Some(&lock_hint(false, lock_toggles(host))),
                 );
                 let tick = with_cache(|cache| cache.tick);
                 *CANDIDATE.lock().unwrap_or_else(|p| p.into_inner()) = Some(Candidate {
@@ -1874,7 +2001,7 @@ impl Hooks for UniversalViewer {
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
         let tick = with_cache(|cache| cache.tick);
-        if !is_control(event.key) {
+        if !is_key(host, KEY_LOCK, event.key) {
             // A key can move items (a hotbar number, Q): look at the slots again soon.
             rescan_soon(tick);
             return Flow::Continue;
@@ -1942,7 +2069,7 @@ impl Hooks for UniversalViewer {
             return;
         }
         // Hold mode: letting go of Ctrl lets go of the panel.
-        if !lock_toggles(host) && !host.modifiers().control() {
+        if !lock_toggles(host) && !held(host, KEY_LOCK) {
             *guard = None;
             return;
         }
@@ -1952,7 +2079,7 @@ impl Hooks for UniversalViewer {
             locked.at,
             &locked.title,
             &locked.contents,
-            Some(lock_hint(true, lock_toggles(host))),
+            Some(&lock_hint(true, lock_toggles(host))),
         );
         locked.layout = Some(layout);
         let mouse = event.screen.mouse;

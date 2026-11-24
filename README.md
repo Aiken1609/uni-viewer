@@ -72,8 +72,12 @@ horizon-launcher native-build . --instance "NamaInstance" --trust-native-code
 
 Tanpa `Shift`, shulker box dan bundle menampilkan petunjuk merah "Hold Shift to view contents". Klik di atas panel
 yang terkunci tidak mengambil item di slot di bawahnya. Pengaturannya ada di Options > Mods > Universal Viewer:
-**Ctrl lock** (tahan atau tekan), **Tooltip map size** (64, 96, atau 128 px), dan **Shulker and bundle slot marks**
+**Lock key** (tahan atau tekan), **Tooltip map size** (64, 96, atau 128 px), dan **Shulker and bundle slot marks**
 (bar isi dan item terbanyak, bar saja, item saja, atau mati).
+
+Ketiga tombolnya bisa diganti di Options > Controls, di bawah nama mod ini: **Show contents (grid)** (bawaan Shift),
+**Show contents (list)** (bawaan Alt), dan **Lock contents preview** (bawaan Ctrl). Untuk Shift, Ctrl, dan Alt, sisi
+kiri maupun kanan sama-sama berlaku. Hint di tooltip ikut menampilkan tombol yang dipilih.
 
 ## Batasan
 
