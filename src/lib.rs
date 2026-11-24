@@ -383,7 +383,9 @@ fn view_of(host: &dyn ClientHost, stack: &ItemStack, with_contents: bool) -> Opt
         if slots.is_empty() {
             return None;
         }
-        return Some(View::Contents(finish(COLUMNS, 3, slots, ENDER_COLOR)));
+        let highest = slots.iter().map(|(slot, _)| *slot).max().unwrap_or(0);
+        let rows = (highest / COLUMNS + 1).max(3);
+        return Some(View::Contents(finish(COLUMNS, rows, slots, ENDER_COLOR)));
     }
     let root = components(stack)?;
     if let Some(id) = root.get("minecraft:map_id").and_then(int) {
@@ -1618,16 +1620,71 @@ fn ender_memory(host: &dyn ClientHost) -> Option<Vec<(usize, ItemStack)>> {
         .cloned()
 }
 
-/// Whether the open screen is an ender chest's: a 9 x 3 menu titled with the game's own
-/// "Ender Chest" key (a plugin's look-alike with its own title isn't taken for one).
-fn is_ender_screen(screen: &ScreenView<'_>) -> bool {
-    screen.menu == Some("minecraft:generic_9x3")
-        && screen.title.is_some_and(|title| {
-            matches!(&title.content, TextContent::Translatable { key, .. } if key == "container.enderchest")
-        })
+/// Whether the open screen is an ender chest's: a chest-like menu (one to six rows: servers
+/// often give a bigger one) opened on an ender chest block the player looks at, or, looking at
+/// no block or entity, titled "Ender Chest" (the game's own key, the name in the selected
+/// language, or English, as a server's `/ec` sends it, colours and decorations aside).
+fn is_ender_screen(host: &dyn ClientHost, screen: &ScreenView<'_>) -> bool {
+    if !screen
+        .menu
+        .is_some_and(|menu| menu.starts_with("minecraft:generic_9x"))
+    {
+        return false;
+    }
+    // Looking at a block, the block decides: a chest or barrel renamed "Ender Chest" in an anvil
+    // is not one. Looking at an entity (a chest boat or minecart, which can be renamed too), it
+    // isn't one either. Only with neither, as after a server's `/ec`, the title decides.
+    match host.crosshair_target() {
+        Some(mod_api::CrosshairTarget::Block { .. }) => return aimed_block_is(host, "ender_chest"),
+        Some(mod_api::CrosshairTarget::Entity { .. }) => return false,
+        _ => {}
+    }
+    let Some(title) = screen.title else {
+        return false;
+    };
+    if matches!(&title.content, TextContent::Translatable { key, .. } if key == "container.enderchest")
+    {
+        return true;
+    }
+    let text = unsmall(&plain(host, title).to_lowercase());
+    let local = host
+        .translate("container.enderchest")
+        .map(|name| name.to_lowercase());
+    text.contains("ender chest")
+        || text.contains("enderchest")
+        || local.is_some_and(|name| !name.is_empty() && text.contains(&name))
 }
 
-/// While an ender chest is open, reads its 27 slots every few ticks.
+/// Small-capital letters, as server menu titles often spell words ("ᴇɴᴅᴇʀ ᴄʜᴇꜱᴛ"), as plain ones.
+fn unsmall(text: &str) -> String {
+    const SMALL: [(char, char); 26] = [
+        ('ᴀ', 'a'), ('ʙ', 'b'), ('ᴄ', 'c'), ('ᴅ', 'd'), ('ᴇ', 'e'), ('ꜰ', 'f'), ('ɢ', 'g'),
+        ('ʜ', 'h'), ('ɪ', 'i'), ('ᴊ', 'j'), ('ᴋ', 'k'), ('ʟ', 'l'), ('ᴍ', 'm'), ('ɴ', 'n'),
+        ('ᴏ', 'o'), ('ᴘ', 'p'), ('ǫ', 'q'), ('ʀ', 'r'), ('ꜱ', 's'), ('ᴛ', 't'), ('ᴜ', 'u'),
+        ('ᴠ', 'v'), ('ᴡ', 'w'), ('x', 'x'), ('ʏ', 'y'), ('ᴢ', 'z'),
+    ];
+    text.chars()
+        .map(|c| SMALL.iter().find(|(small, _)| *small == c).map_or(c, |(_, plain)| *plain))
+        .collect()
+}
+
+/// Whether the crosshair is on a block `minecraft:<path>`.
+fn aimed_block_is(host: &dyn ClientHost, path: &str) -> bool {
+    match host.crosshair_target() {
+        Some(mod_api::CrosshairTarget::Block { state, .. }) => host
+            .block_state_string(state)
+            .and_then(|id| {
+                id.split('[')
+                    .next()
+                    .and_then(|id| id.rsplit(':').next())
+                    .map(|p| p == path)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// While an ender chest is open, reads its slots every few ticks.
 fn remember_ender(host: &dyn ClientHost, tick: u64) {
     if tick.saturating_sub(ENDER_SEEN.load(Ordering::Relaxed)) > 2 || tick % 5 != 0 {
         return;
@@ -1639,11 +1696,16 @@ fn remember_ender(host: &dyn ClientHost, tick: u64) {
         return;
     };
     let read = host as &dyn mod_api::Host;
-    if menu.slot_count(read) != Some(63) {
+    // The chest's own slots come first, the player's 36 after them.
+    let Some(total) = menu.slot_count(read) else {
+        return;
+    };
+    let own = total.saturating_sub(36);
+    if own == 0 || own % COLUMNS != 0 || own > 54 {
         return;
     }
     let mut slots = Vec::new();
-    for slot in 0..27 {
+    for slot in 0..own {
         if let Some(Some(stack)) = menu.slot(read, slot) {
             slots.push((slot, stack));
         }
@@ -1987,7 +2049,7 @@ impl Hooks for UniversalViewer {
     ) {
         let tick = with_cache(|cache| cache.tick);
         SCREEN_SEEN.store(tick, Ordering::Relaxed);
-        if is_ender_screen(event.screen) {
+        if is_ender_screen(host, event.screen) {
             ENDER_SEEN.store(tick, Ordering::Relaxed);
         }
         draw_menu_maps(host, &mut *event.draw, event.screen);
