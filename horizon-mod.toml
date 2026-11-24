@@ -1,12 +1,12 @@
 id = "universal_viewer"
 name = "Universal Viewer"
-version = "0.2.0"
+version = "0.2.1"
 description = "Map pictures on slot icons and in the tooltip; see inside shulker boxes and bundles by holding Shift; placed shulker boxes open in their own colour."
 authors = []
 license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.
 api = "0.2"
-side = "both"
+side = "client"
 # registries: "May add blocks, items, mob effects and entity types to your worlds".
 capabilities = ["registries"]
 
