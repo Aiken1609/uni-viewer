@@ -1,4 +1,4 @@
-<p align="center">
+<p align="center" style="border-radius: 12px;>
   <img src="icon.png" alt="Universal Viewer" width="256">
 </p>
 
