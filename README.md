@@ -1,5 +1,5 @@
-<p align="center" style="border-radius: 12px;">
-  <img src="icon.png" alt="Universal Viewer" width="256">
+<p align="center">
+  <img src="docs/icon-rounded.png" alt="Universal Viewer" width="256">
 </p>
 
 <h1 align="center">Universal Viewer</h1>
