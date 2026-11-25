@@ -1539,6 +1539,14 @@ fn show_inner(
 ) {
     let screen = draw.size();
     let name = host.hover_name(stack);
+    // The list key (without the grid's), as over a slot: the contents as a list.
+    if !held(host, KEY_CONTENTS)
+        && held(host, KEY_LIST)
+        && let Some(View::Contents(contents)) = view_of(host, stack, true)
+    {
+        draw_summary(host, draw, mouse, screen, &name, &contents);
+        return;
+    }
     if held(host, KEY_CONTENTS)
         && let Some(View::Contents(contents)) = view_of(host, stack, true)
     {
@@ -2395,11 +2403,22 @@ fn set_query(text: &str) {
     }
 }
 
-/// Whether `stack`'s name, or the name of something inside it (one level of shulker box or
-/// bundle, or the remembered ender chest), holds `query`.
+/// How deep the search looks into holders inside holders: a bundle in a shulker box in the
+/// remembered ender chest is three deep. Bundles can hold bundles, so this also bounds that.
+const SEARCH_DEPTH: u32 = 3;
+
+/// Whether `stack`'s name, or the name of something inside it (shulker boxes and bundles, and
+/// the remembered ender chest, up to [`SEARCH_DEPTH`] holders deep), holds `query`.
 fn matches_search(host: &dyn ClientHost, stack: &ItemStack, query: &str) -> bool {
+    matches_within(host, stack, query, 0)
+}
+
+fn matches_within(host: &dyn ClientHost, stack: &ItemStack, query: &str, depth: u32) -> bool {
     if host.hover_name(stack).to_lowercase().contains(query) {
         return true;
+    }
+    if depth >= SEARCH_DEPTH {
+        return false;
     }
     let item = stack.item();
     let holder = SHULKERS.get().is_some_and(|set| set.contains(&item))
@@ -2414,7 +2433,7 @@ fn matches_search(host: &dyn ClientHost, stack: &ItemStack, query: &str) -> bool
     contents
         .slots
         .iter()
-        .any(|(_, inner)| host.hover_name(inner).to_lowercase().contains(query))
+        .any(|(_, inner)| matches_within(host, inner, query, depth + 1))
 }
 
 /// Whether the open screen gets a search field: a container screen whose slots the game places
