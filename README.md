@@ -9,6 +9,23 @@
   Sepenuhnya di sisi client, jadi jalan di server mana pun, termasuk server vanilla.
 </p>
 
+## Preview
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/1.png" alt="Gambar map di slot dan tooltip"><br><sub>Gambar map di slot chest dan tooltip map, lengkap dengan ID, skala, dan status lock.</sub></td>
+    <td width="50%"><img src="docs/screenshots/5.png" alt="Tooltip map di menu server"><br><sub>Tooltip map di menu server; baris dari server, seperti harga, tetap tampil.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/2.png" alt="Isi bundle dengan Shift"><br><sub>Tahan Shift untuk melihat isi shulker box atau bundle sebagai grid.</sub></td>
+    <td width="50%"><img src="docs/screenshots/6.png" alt="Daftar isi dengan Alt"><br><sub>Tahan Alt untuk melihat isinya sebagai daftar, dari item yang paling banyak.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/3.png" alt="Ingatan ender chest"><br><sub>Isi ender chest terakhir kali dibuka, dilihat dari item ender chest.</sub></td>
+    <td width="50%"><img src="docs/screenshots/4.png" alt="Kotak cari"><br><sub>Kotak cari: slot yang cocok diberi garis, sisanya digelapkan.</sub></td>
+  </tr>
+</table>
+
 ## Fitur
 
 - **Gambar map di slot**: map yang sudah termuat menampilkan gambarnya sendiri sebagai ikon, penuh tanpa bingkai,
